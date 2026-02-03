@@ -1,0 +1,101 @@
+plugins {
+    alias(libs.plugins.jmh)
+    id 'java-library'
+    id 'maven-publish'
+}
+
+group = "com.codeabbot"
+version = "1.0.0"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+    withSourcesJar()
+    withJavadocJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation libs.slf4j.api
+    implementation libs.micrometer.core
+
+    testImplementation libs.bundles.testing
+    testImplementation libs.nma
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    
+    jmh libs.jmh.core
+    jmh libs.jmh.annproc
+    jmh libs.caffeine
+    jmh libs.nma
+    jmh "org.ehcache:ehcache:3.10.8"
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    testLogging {
+        events("passed", "skipped", "failed", "standardOut", "standardError")
+        showStandardStreams = true
+    }
+}
+
+jmh {
+    includes = [project.findProperty("jmh.includes")?.toString() ?: "ComparativeWorkloadBenchmark"]
+    iterations = project.findProperty("jmh.iterations")?.toString()?.toInteger() ?: 2
+    warmupIterations = project.findProperty("jmh.warmupIterations")?.toString()?.toInteger() ?: 1
+    fork = 1
+    threads = project.findProperty("jmh.threads")?.toString()?.toInteger() ?: 4
+    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Xmx8g", "-XX:+UseG1GC"]
+    resultFormat = "text"
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            pom {
+                name = "RMCache"
+                description = "High-performance billion-scale off-heap cache for JVM (JDK 25+)"
+                url = "https://github.com/codeabbot/rmcache"
+                licenses {
+                    license {
+                        name = "The Apache License, Version 2.0"
+                        url = "http://www.apache.org/licenses/LICENSE-2.0.txt"
+                    }
+                }
+                developers {
+                    developer {
+                        id = "codeabbot"
+                        name = "CodeAbbot Team"
+                        email = "maintainers@codeabbot.com"
+                    }
+                }
+                scm {
+                    connection = "scm:git:git://github.com/codeabbot/rmcache.git"
+                    developerConnection = "scm:git:ssh://github.com/codeabbot/rmcache.git"
+                    url = "https://github.com/codeabbot/rmcache"
+                }
+            }
+        }
+    }
+}
+
+tasks.register('runMemoryBenchmark', JavaExec) {
+    group = "benchmark"
+    description = "Runs the Memory Comparison Benchmark"
+    classpath = sourceSets.jmh.runtimeClasspath
+    mainClass = "com.codeabbot.rmcache.benchmark.MemoryBenchmarkRunner"
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-Xmx8g")
+}
+
+tasks.register('runMemoryScalability', JavaExec) {
+    group = "benchmark"
+    description = "Runs the Memory Scalability Suite (10k-1M + 1B Projection)"
+    classpath = sourceSets.jmh.runtimeClasspath
+    mainClass = "com.codeabbot.rmcache.benchmark.MemoryScalabilitySuite"
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-Xmx8g")
+}

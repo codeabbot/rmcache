@@ -1,0 +1,94 @@
+package com.codeabbot.rmcache.index;
+
+import com.codeabbot.rmcache.memory.NativeMemory;
+import com.codeabbot.rmcache.serializer.KeySerializer;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+
+/**
+ * Off-heap L1 cache storing (hash, slot) pairs for hot keys.
+ * Direct-mapped, best-effort, zero-heap.
+ */
+public final class OffHeapGhostCache implements AutoCloseable {
+    private static final int SLOT_SIZE = 8;
+
+    private final int capacity;
+    private final int mask;
+    private final MemorySegment table;
+    private final long baseAddr;
+
+    public OffHeapGhostCache(int capacity) {
+        int cap = 1;
+        while (cap < capacity) {
+            cap <<= 1;
+        }
+        this.capacity = cap;
+        this.mask = cap - 1;
+        this.table = NativeMemory.calloc(cap, SLOT_SIZE);
+        this.baseAddr = table.address();
+    }
+
+    public int getSlot(Object key, int keyHash, EntryPool entryPool, KeySerializer serializer) {
+        int idx = keyHash & mask;
+        long entry = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, baseAddr + ((long) idx << 3));
+        if (entry == 0L) {
+            return 0;
+        }
+
+        int storedHash = (int) (entry >>> 32);
+        if (storedHash != keyHash) {
+            return 0;
+        }
+
+        int slot = (int) entry;
+        if (slot == 0) {
+            return 0;
+        }
+
+        long offset = entryPool.getOffset(slot);
+        if (offset == -1L) {
+            return 0;
+        }
+
+        if (!entryPool.matches(slot, key, serializer)) {
+            return 0;
+        }
+
+        return slot;
+    }
+
+    public void put(int keyHash, int slot) {
+        if (slot == 0) {
+            return;
+        }
+        int idx = keyHash & mask;
+        long entry = ((long) keyHash << 32) | (slot & 0xFFFFFFFFL);
+        NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, baseAddr + ((long) idx << 3), entry);
+    }
+
+    public void invalidate(int keyHash) {
+        int idx = keyHash & mask;
+        long addr = baseAddr + ((long) idx << 3);
+        long entry = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, addr);
+        if (entry == 0L) {
+            return;
+        }
+        int storedHash = (int) (entry >>> 32);
+        if (storedHash == keyHash) {
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, addr, 0L);
+        }
+    }
+
+    public void clear() {
+        table.fill((byte) 0);
+    }
+
+    public int capacity() {
+        return capacity;
+    }
+
+    @Override
+    public void close() {
+        NativeMemory.free(table);
+    }
+}
