@@ -47,6 +47,7 @@ public class AdvancedFeaturesTest {
                 .offHeapMemory(1024 * 1024)
                 .maxEntries(1) // Force eviction immediately
                 .evictionListener(listener)
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         cache.put("Keep", "V".getBytes(StandardCharsets.UTF_8));
@@ -74,6 +75,7 @@ public class AdvancedFeaturesTest {
                 .offHeapMemory(1024 * 1024)
                 .maxEntries(2)
                 .evictionFilter(filter)
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         cache.put("Pinned-1", "V".getBytes(StandardCharsets.UTF_8));

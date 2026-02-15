@@ -131,6 +131,7 @@ public class MetricsTest {
                 .withMeterRegistry(registry)
                 .keySerializer(BuiltInSerializers.STRING_KEY)
                 .valueSerializer(BuiltInSerializers.string())
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         try {

@@ -6,6 +6,7 @@ import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
+import com.codeabbot.rmcache.serializer.StringEncoding;
 import org.openjdk.jmh.annotations.*;
 
 import java.util.concurrent.ThreadLocalRandom;
@@ -56,9 +57,10 @@ public class HotKeyBenchmark {
         cacheWithGhost = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(2))
                 .maxEntries(entryCount * 2)
-                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
+                .hashTableLoadFactor(0.5d)
                 .ghostCacheSize(4096) // L1 cache for hot keys
                 .ghostCacheMode(GhostCacheMode.HEAP)
                 .build();
@@ -67,9 +69,10 @@ public class HotKeyBenchmark {
         cacheWithOffHeapGhost = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(2))
                 .maxEntries(entryCount * 2)
-                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
+                .hashTableLoadFactor(0.5d)
                 .ghostCacheSize(4096)
                 .ghostCacheMode(GhostCacheMode.OFF_HEAP)
                 .build();
@@ -78,9 +81,10 @@ public class HotKeyBenchmark {
         cacheWithoutGhost = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(2))
                 .maxEntries(entryCount * 2)
-                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
+                .hashTableLoadFactor(0.5d)
                 .build();
 
         // Pre-populate both caches

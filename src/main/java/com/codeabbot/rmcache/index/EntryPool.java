@@ -33,6 +33,23 @@ public class EntryPool implements AutoCloseable {
 
     private static final VarHandle LONG_HANDLE = ValueLayout.JAVA_LONG.varHandle();
     private static final ValueLayout.OfLong UNALIGNED_LONG = ValueLayout.JAVA_LONG.withByteAlignment(1);
+    private static final long FINGERPRINT_OFFSET = 17L;
+
+    // O8: Pack size class into upper 16 bits of offset table entries.
+    // On x86-64/AArch64, virtual addresses use at most 48 bits.
+    private static final long ADDR_MASK = 0x0000_FFFF_FFFF_FFFFL;
+
+    static long packOffset(long absOffset, int sizeClass) {
+        return (absOffset & ADDR_MASK) | ((long) (sizeClass & 0xFF) << 48);
+    }
+
+    static long unpackAddr(long packed) {
+        return packed & ADDR_MASK;
+    }
+
+    static int unpackSC(long packed) {
+        return (int) ((packed >>> 48) & 0xFF);
+    }
 
     public EntryPool(SlabAllocator allocator, int maxEntries, int numPartitions) {
         if (numPartitions <= 0 || (numPartitions & (numPartitions - 1)) != 0) {
@@ -94,6 +111,14 @@ public class EntryPool implements AutoCloseable {
                 expiresAtMillis);
     }
 
+    public <V> int allocateWithSerializer(int keyHash, byte[] keyBytes, int keyLen, int valueMaxLen,
+            com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value, short priority,
+            long expiresAtMillis) {
+        int pIdx = ((keyHash ^ (keyHash >>> 16)) & numPartitionsMask);
+        return partitions[pIdx].allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, serializer, value,
+                priority, expiresAtMillis);
+    }
+
     public void free(int slot) {
         if (slot <= 0)
             return;
@@ -102,32 +127,68 @@ public class EntryPool implements AutoCloseable {
     }
 
     public long getOffset(int slot) {
-        return (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+        long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+        return (packed == -1L) ? -1L : unpackAddr(packed);
     }
 
     public int getSlotFromOffset(long offset) {
-        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 16);
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 12);
     }
 
     public boolean keyEqualsWithLen(long offset, byte[] keyBytes, int keyLen) {
         if (offset == -1L)
             return false;
-        int storedKeyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
+        int storedKeyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
         if (storedKeyLen != keyLen)
             return false;
 
-        long keyStart = offset + 28;
-        MemorySegment storedKeySegment = NativeMemory.UNLIMITED.asSlice(keyStart, (long) keyLen);
-        MemorySegment keySegment = MemorySegment.ofArray(keyBytes).asSlice(0, (long) keyLen);
+        byte expected = computeFingerprint(keyBytes, keyLen);
+        byte stored = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, offset + FINGERPRINT_OFFSET);
+        if (stored != expected)
+            return false;
 
-        return storedKeySegment.mismatch(keySegment) == -1L;
+        return compareKeyBytes(offset + 24, keyBytes, keyLen);
     }
 
     public boolean keyEqualsNoLenCheck(long offset, byte[] keyBytes, int keyLen) {
-        long keyStart = offset + 28;
-        MemorySegment storedKeySegment = NativeMemory.UNLIMITED.asSlice(keyStart, (long) keyLen);
-        MemorySegment keySegment = MemorySegment.ofArray(keyBytes).asSlice(0, (long) keyLen);
-        return storedKeySegment.mismatch(keySegment) == -1L;
+        byte expected = computeFingerprint(keyBytes, keyLen);
+        byte stored = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, offset + FINGERPRINT_OFFSET);
+        if (stored != expected)
+            return false;
+        return compareKeyBytes(offset + 24, keyBytes, keyLen);
+    }
+
+    /**
+     * Fast key comparison using long-word (8 bytes at a time) reads.
+     * For a 16-byte key, this does 2 reads instead of 16.
+     */
+    private static boolean compareKeyBytes(long keyStart, byte[] keyBytes, int keyLen) {
+        MemorySegment keySegment = MemorySegment.ofArray(keyBytes);
+        int i = 0;
+        // Compare 8 bytes at a time
+        for (; i + 8 <= keyLen; i += 8) {
+            long offHeapWord = NativeMemory.UNLIMITED.get(UNALIGNED_LONG, keyStart + i);
+            long onHeapWord = keySegment.get(UNALIGNED_LONG, i);
+            if (offHeapWord != onHeapWord)
+                return false;
+        }
+        // Compare remaining bytes (0-7 tail bytes)
+        for (; i < keyLen; i++) {
+            if (NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, keyStart + i) != keyBytes[i])
+                return false;
+        }
+        return true;
+    }
+
+    private static byte computeFingerprint(byte[] keyBytes, int keyLen) {
+        if (keyLen <= 0) {
+            return 0;
+        }
+        int fp = keyLen;
+        fp ^= keyBytes[0];
+        fp ^= keyBytes[keyLen >>> 1];
+        fp ^= keyBytes[keyLen - 1];
+        return (byte) fp;
     }
 
     @SuppressWarnings("unchecked")
@@ -137,9 +198,9 @@ public class EntryPool implements AutoCloseable {
         long offset = getOffset(slot);
         if (offset == -1L)
             return false;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
         long relOffset = offset - baseAddr;
-        return serializer.matches(key, baseSegment, relOffset + 28, keyLen);
+        return serializer.matches(key, baseSegment, relOffset + 24, keyLen);
     }
 
     public int getKeyHash(int slot) {
@@ -149,12 +210,12 @@ public class EntryPool implements AutoCloseable {
 
     public short getPriority(int slot) {
         long offset = getOffset(slot);
-        return (offset != -1L) ? NativeMemory.UNLIMITED.get(ValueLayout.JAVA_SHORT, offset + 22) : 0;
+        return (offset != -1L) ? NativeMemory.UNLIMITED.get(ValueLayout.JAVA_SHORT, offset + 18) : 0;
     }
 
     public long getExpiresAt(int slot) {
         long offset = getOffset(slot);
-        return (offset != -1L) ? NativeMemory.UNLIMITED.get(UNALIGNED_LONG, offset + 8) : 0L;
+        return (offset != -1L) ? NativeMemory.UNLIMITED.get(UNALIGNED_LONG, offset + 4) : 0L;
     }
 
     public boolean isExpired(int slot) {
@@ -166,9 +227,9 @@ public class EntryPool implements AutoCloseable {
         long offset = getOffset(slot);
         if (offset == -1L)
             return null;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
         byte[] bytes = new byte[keyLen];
-        MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, offset + 28, bytes, 0, keyLen);
+        MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, offset + 24, bytes, 0, keyLen);
         return bytes;
     }
 
@@ -176,8 +237,8 @@ public class EntryPool implements AutoCloseable {
         long offset = getOffset(slot);
         if (offset == -1L)
             return null;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
-        long vOffset = offset + 24 + 4 + EntryBlockLayout.pad(keyLen);
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
         int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
         byte[] bytes = new byte[vLen];
         MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, bytes, 0, vLen);
@@ -198,20 +259,26 @@ public class EntryPool implements AutoCloseable {
         return partitions[pIdx].updateValueWithWriter(slot, valueMaxLen, writer);
     }
 
+    public <V> boolean updateValueWithSerializer(int slot, int valueMaxLen,
+            com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value) {
+        int pIdx = slot >>> partitionShift;
+        return partitions[pIdx].updateValueWithSerializer(slot, valueMaxLen, serializer, value);
+    }
+
     public int getValueLen(int slot) {
         long offset = getOffset(slot);
         if (offset == -1L)
             return 0;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
-        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24 + 4 + EntryBlockLayout.pad(keyLen));
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20 + 4 + EntryBlockLayout.pad(keyLen));
     }
 
     public MemorySegment getValueSegment(int slot) {
         long offset = getOffset(slot);
         if (offset == -1L)
             return null;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
-        long vOffset = offset + 24 + 4 + EntryBlockLayout.pad(keyLen);
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
         int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
         return NativeMemory.UNLIMITED.asSlice(vOffset + 4, (long) vLen);
     }
@@ -220,8 +287,8 @@ public class EntryPool implements AutoCloseable {
         long offset = getOffset(slot);
         if (offset == -1L)
             return;
-        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 24);
-        long vOffset = offset + 24 + 4 + EntryBlockLayout.pad(keyLen);
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
         MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, buffer, bufferOffset, length);
     }
 
@@ -259,10 +326,14 @@ public class EntryPool implements AutoCloseable {
 
                 if (freeTop.compareAndSet(top, top - 1)) {
                     int totalSize = EntryBlockLayout.computeSize(keyLen, valueLen);
-                    AllocationHandle handle;
+                    long packedHandle;
                     try {
-                        handle = allocator.allocate(totalSize);
+                        packedHandle = allocator.allocatePacked(totalSize);
                     } catch (Exception e) {
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+                    if (packedHandle == -1L) {
                         freeTop.incrementAndGet();
                         return 0;
                     }
@@ -274,12 +345,15 @@ public class EntryPool implements AutoCloseable {
                         return 0;
                     }
 
-                    long absOffset = baseAddr + handle.getOffset();
-                    writeHeader(absOffset, keyHash, handle.getCapacity(), handle.getSizeClass(), priority,
-                            expiresAtMillis, slot);
+                    long absOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                    int capacity = AllocationHandle.unpackCapacity(packedHandle);
+                    int sizeClass = AllocationHandle.unpackSizeClass(packedHandle);
+                    byte fingerprint = computeFingerprint(keyBytes, keyLen);
+                    writeHeader(absOffset, keyHash, capacity, sizeClass, priority,
+                            expiresAtMillis, slot, fingerprint);
                     writeData(absOffset, keyBytes, keyLen, valueBytes, valueLen);
 
-                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, absOffset);
+                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, packOffset(absOffset, sizeClass));
                     return slot;
                 }
             }
@@ -294,10 +368,14 @@ public class EntryPool implements AutoCloseable {
 
                 if (freeTop.compareAndSet(top, top - 1)) {
                     int totalSize = EntryBlockLayout.computeSize(keyLen, valueMaxLen);
-                    AllocationHandle handle;
+                    long packedHandle;
                     try {
-                        handle = allocator.allocate(totalSize);
+                        packedHandle = allocator.allocatePacked(totalSize);
                     } catch (Exception e) {
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+                    if (packedHandle == -1L) {
                         freeTop.incrementAndGet();
                         return 0;
                     }
@@ -309,20 +387,70 @@ public class EntryPool implements AutoCloseable {
                         return 0;
                     }
 
-                    long absOffset = baseAddr + handle.getOffset();
-                    writeHeader(absOffset, keyHash, handle.getCapacity(), handle.getSizeClass(), priority,
-                            expiresAtMillis, slot);
+                    long absOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                    int capacity = AllocationHandle.unpackCapacity(packedHandle);
+                    int sizeClass = AllocationHandle.unpackSizeClass(packedHandle);
+                    byte fingerprint = computeFingerprint(keyBytes, keyLen);
+                    writeHeader(absOffset, keyHash, capacity, sizeClass, priority,
+                            expiresAtMillis, slot, fingerprint);
                     boolean ok = writeDataWithWriter(absOffset, keyBytes, keyLen, valueMaxLen, writer);
                     if (!ok) {
-                        int cap = handle.getCapacity();
-                        int sc = handle.getSizeClass();
                         long relOffset = absOffset - baseAddr;
-                        allocator.free(new AllocationHandle(baseSegment, relOffset, cap, sc));
+                        allocator.freePacked(AllocationHandle.pack(relOffset, capacity, sizeClass));
                         freeTop.incrementAndGet();
                         return 0;
                     }
 
-                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, absOffset);
+                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, packOffset(absOffset, sizeClass));
+                    return slot;
+                }
+            }
+        }
+
+        public <V> int allocateWithSerializer(int keyHash, byte[] keyBytes, int keyLen, int valueMaxLen,
+                com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value, short priority,
+                long expiresAtMillis) {
+            while (true) {
+                int top = freeTop.get();
+                if (top == 0)
+                    return 0;
+
+                if (freeTop.compareAndSet(top, top - 1)) {
+                    int totalSize = EntryBlockLayout.computeSize(keyLen, valueMaxLen);
+                    long packedHandle;
+                    try {
+                        packedHandle = allocator.allocatePacked(totalSize);
+                    } catch (Exception e) {
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+                    if (packedHandle == -1L) {
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+
+                    int localIdx = freeSlots.getAtIndex(ValueLayout.JAVA_INT, (long) (top - 1));
+                    int slot = (id << partitionShift) | localIdx;
+                    if (slot == 0) {
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+
+                    long absOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                    int capacity = AllocationHandle.unpackCapacity(packedHandle);
+                    int sizeClass = AllocationHandle.unpackSizeClass(packedHandle);
+                    byte fingerprint = computeFingerprint(keyBytes, keyLen);
+                    writeHeader(absOffset, keyHash, capacity, sizeClass, priority,
+                            expiresAtMillis, slot, fingerprint);
+                    boolean ok = writeDataWithSerializer(absOffset, keyBytes, keyLen, valueMaxLen, serializer, value);
+                    if (!ok) {
+                        long relOffset = absOffset - baseAddr;
+                        allocator.freePacked(AllocationHandle.pack(relOffset, capacity, sizeClass));
+                        freeTop.incrementAndGet();
+                        return 0;
+                    }
+
+                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, packOffset(absOffset, sizeClass));
                     return slot;
                 }
             }
@@ -330,13 +458,14 @@ public class EntryPool implements AutoCloseable {
 
         public void free(int slot) {
             int localIdx = slot & partitionMask;
-            long absOffset = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
-            if (absOffset != -1L) {
-                int cap = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 4);
-                int sc = (int) NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, absOffset + 20);
+            long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+            if (packed != -1L) {
+                long absOffset = unpackAddr(packed);
+                int sc = unpackSC(packed);
+                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
 
                 long relOffset = absOffset - baseAddr;
-                allocator.free(new AllocationHandle(baseSegment, relOffset, cap, sc));
+                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
 
                 LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, -1L);
 
@@ -349,46 +478,74 @@ public class EntryPool implements AutoCloseable {
             }
         }
 
+        // O2: Lock-free fast path for in-place value update
         public boolean updateValue(int slot, byte[] valueBytes, int valueLen) {
+            long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+            if (packed == -1L)
+                return false;
+            long absOffset = unpackAddr(packed);
+            int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+            int sc = unpackSC(packed);
+            int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+            int newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
+
+            if (newSize <= cap) {
+                // Fast path: value fits — no lock needed, slot region is exclusive
+                long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
+                NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
+                MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
+                        valueLen);
+                return true;
+            }
+
+            // Slow path: reallocation needed — acquire lock
             lock.lock();
             try {
-                long absOffset = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
-                if (absOffset == -1L)
+                // Re-read under lock — offset may have changed
+                packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+                if (packed == -1L)
                     return false;
-                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 24);
-                int cap = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 4);
-                int newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
+                absOffset = unpackAddr(packed);
+                keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+                sc = unpackSC(packed);
+                cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+                newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
 
+                // Re-check: another thread may have reallocated to bigger capacity
                 if (newSize <= cap) {
-                    long vOffset = absOffset + 24 + 4 + EntryBlockLayout.pad(keyLen);
+                    long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
                     NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
                     MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
                             valueLen);
                     return true;
-                } else {
-                    int h = getKeyHash(slot);
-                    byte[] k = readKey(slot);
-                    short p = getPriority(slot);
-                    long e = getExpiresAt(slot);
-
-                    AllocationHandle newH;
-                    try {
-                        newH = allocator.allocate(newSize);
-                    } catch (Exception err) {
-                        return false;
-                    }
-                    int sc = (int) NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, absOffset + 20);
-
-                    long relOffset = absOffset - baseAddr;
-                    allocator.free(new AllocationHandle(baseSegment, relOffset, cap, sc));
-
-                    long newAbsOffset = baseAddr + newH.getOffset();
-                    writeHeader(newAbsOffset, h, newH.getCapacity(), newH.getSizeClass(), p, e, slot);
-                    writeData(newAbsOffset, k, k.length, valueBytes, valueLen);
-
-                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, newAbsOffset);
-                    return true;
                 }
+
+                int h = getKeyHash(slot);
+                byte[] k = readKey(slot);
+                short p = getPriority(slot);
+                long e = getExpiresAt(slot);
+
+                long packedHandle;
+                try {
+                    packedHandle = allocator.allocatePacked(newSize);
+                } catch (Exception err) {
+                    return false;
+                }
+                if (packedHandle == -1L)
+                    return false;
+
+                long relOffset = absOffset - baseAddr;
+                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
+
+                long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                byte fingerprint = computeFingerprint(k, k.length);
+                writeHeader(newAbsOffset, h, AllocationHandle.unpackCapacity(packedHandle),
+                        AllocationHandle.unpackSizeClass(packedHandle), p, e, slot, fingerprint);
+                writeData(newAbsOffset, k, k.length, valueBytes, valueLen);
+
+                LONG_HANDLE.setVolatile(offsets, (long) slot * 8L,
+                        packOffset(newAbsOffset, AllocationHandle.unpackSizeClass(packedHandle)));
+                return true;
             } finally {
                 lock.unlock();
             }
@@ -397,15 +554,17 @@ public class EntryPool implements AutoCloseable {
         public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer) {
             lock.lock();
             try {
-                long absOffset = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
-                if (absOffset == -1L)
+                long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+                if (packed == -1L)
                     return false;
-                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 24);
-                int cap = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 4);
+                long absOffset = unpackAddr(packed);
+                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+                int sc = unpackSC(packed);
+                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0; // derive capacity
                 int newSize = EntryBlockLayout.computeSize(keyLen, valueMaxLen);
 
                 if (newSize <= cap) {
-                    long vOffset = absOffset + 24 + 4 + EntryBlockLayout.pad(keyLen);
+                    long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
                     int written = writer.write(NativeMemory.UNLIMITED, vOffset + 4, valueMaxLen);
                     if (written < 0 || written > valueMaxLen) {
                         return false;
@@ -418,28 +577,31 @@ public class EntryPool implements AutoCloseable {
                     short p = getPriority(slot);
                     long e = getExpiresAt(slot);
 
-                    AllocationHandle newH;
+                    long packedHandle;
                     try {
-                        newH = allocator.allocate(newSize);
+                        packedHandle = allocator.allocatePacked(newSize);
                     } catch (Exception err) {
                         return false;
                     }
-                    int sc = (int) NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, absOffset + 20);
+                    if (packedHandle == -1L)
+                        return false;
+                    // sc already read above at line 520
 
-                    long newAbsOffset = baseAddr + newH.getOffset();
-                    writeHeader(newAbsOffset, h, newH.getCapacity(), newH.getSizeClass(), p, e, slot);
+                    long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                    int newCapacity = AllocationHandle.unpackCapacity(packedHandle);
+                    int newSc = AllocationHandle.unpackSizeClass(packedHandle);
+                    byte fingerprint = computeFingerprint(k, k.length);
+                    writeHeader(newAbsOffset, h, newCapacity, newSc, p, e, slot, fingerprint);
                     boolean ok = writeDataWithWriter(newAbsOffset, k, k.length, valueMaxLen, writer);
                     if (!ok) {
-                        int newCap = newH.getCapacity();
-                        int newSc = newH.getSizeClass();
                         long newRelOffset = newAbsOffset - baseAddr;
-                        allocator.free(new AllocationHandle(baseSegment, newRelOffset, newCap, newSc));
+                        allocator.freePacked(AllocationHandle.pack(newRelOffset, newCapacity, newSc));
                         return false;
                     }
 
-                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, newAbsOffset);
+                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, packOffset(newAbsOffset, newSc));
                     long relOffset = absOffset - baseAddr;
-                    allocator.free(new AllocationHandle(baseSegment, relOffset, cap, sc));
+                    allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
                     return true;
                 }
             } finally {
@@ -447,13 +609,72 @@ public class EntryPool implements AutoCloseable {
             }
         }
 
-        private void writeHeader(long offset, int h, int cap, int sc, short p, long exp, int slot) {
+        public <V> boolean updateValueWithSerializer(int slot, int valueMaxLen,
+                com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value) {
+            lock.lock();
+            try {
+                long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+                if (packed == -1L)
+                    return false;
+                long absOffset = unpackAddr(packed);
+                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+                int sc = unpackSC(packed);
+                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0; // derive capacity
+                int newSize = EntryBlockLayout.computeSize(keyLen, valueMaxLen);
+
+                if (newSize <= cap) {
+                    long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
+                    int written = serializer.serializeTo(value, NativeMemory.UNLIMITED, vOffset + 4, valueMaxLen);
+                    if (written < 0 || written > valueMaxLen) {
+                        return false;
+                    }
+                    NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, written);
+                    return true;
+                } else {
+                    int h = getKeyHash(slot);
+                    byte[] k = readKey(slot);
+                    short p = getPriority(slot);
+                    long e = getExpiresAt(slot);
+
+                    long packedHandle;
+                    try {
+                        packedHandle = allocator.allocatePacked(newSize);
+                    } catch (Exception err) {
+                        return false;
+                    }
+                    if (packedHandle == -1L)
+                        return false;
+                    // sc already read above at line 578
+
+                    long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                    int newCapacity = AllocationHandle.unpackCapacity(packedHandle);
+                    int newSc = AllocationHandle.unpackSizeClass(packedHandle);
+                    byte fingerprint = computeFingerprint(k, k.length);
+                    writeHeader(newAbsOffset, h, newCapacity, newSc, p, e, slot, fingerprint);
+                    boolean ok = writeDataWithSerializer(newAbsOffset, k, k.length, valueMaxLen, serializer, value);
+                    if (!ok) {
+                        long newRelOffset = newAbsOffset - baseAddr;
+                        allocator.freePacked(AllocationHandle.pack(newRelOffset, newCapacity, newSc));
+                        return false;
+                    }
+
+                    LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, packOffset(newAbsOffset, newSc));
+                    long relOffset = absOffset - baseAddr;
+                    allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
+                    return true;
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        private void writeHeader(long offset, int h, int cap, int sc, short p, long exp, int slot, byte fingerprint) {
             NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 0, h);
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 4, cap);
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, offset + 8, exp); // Standard long write
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 16, slot);
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_BYTE, offset + 20, (byte) sc);
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_SHORT, offset + 22, p);
+            NativeMemory.UNLIMITED.set(UNALIGNED_LONG, offset + 4, exp);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 12, slot);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_BYTE, offset + 16, (byte) sc);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_BYTE, offset + FINGERPRINT_OFFSET, fingerprint);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_SHORT, offset + 18, p);
         }
 
         private void writeData(long offset, byte[] keyBytes, int keyLen, byte[] valueBytes, int valueLen) {
@@ -475,6 +696,21 @@ public class EntryPool implements AutoCloseable {
 
             long valLenOffset = dataStart + 4 + EntryBlockLayout.pad(keyLen);
             int written = writer.write(NativeMemory.UNLIMITED, valLenOffset + 4, valueMaxLen);
+            if (written < 0 || written > valueMaxLen) {
+                return false;
+            }
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, valLenOffset, written);
+            return true;
+        }
+
+        private <V> boolean writeDataWithSerializer(long offset, byte[] keyBytes, int keyLen, int valueMaxLen,
+                com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value) {
+            long dataStart = offset + EntryBlockLayout.HEADER_SIZE;
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, dataStart, keyLen);
+            MemorySegment.copy(keyBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, dataStart + 4, keyLen);
+
+            long valLenOffset = dataStart + 4 + EntryBlockLayout.pad(keyLen);
+            int written = serializer.serializeTo(value, NativeMemory.UNLIMITED, valLenOffset + 4, valueMaxLen);
             if (written < 0 || written > valueMaxLen) {
                 return false;
             }

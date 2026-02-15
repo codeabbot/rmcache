@@ -34,6 +34,7 @@ public class ComprehensiveOffHeapCacheTest {
                 .keySerializer(BuiltInSerializers.STRING_KEY)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new LRUPolicy(maxEntries))
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
     }
 

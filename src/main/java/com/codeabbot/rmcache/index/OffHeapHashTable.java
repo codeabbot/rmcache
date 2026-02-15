@@ -19,6 +19,8 @@ public class OffHeapHashTable implements AutoCloseable {
     private final EntryPool entryPool;
     private final int numStripes;
     private final boolean enablePrefetch;
+    private final double loadFactor;
+    private final int initialCapacity;
 
     private final int stripeShift;
     private final int stripeMask;
@@ -37,6 +39,11 @@ public class OffHeapHashTable implements AutoCloseable {
     private static final int MAX_SAME_HASH_PROBE = 32;
 
     public OffHeapHashTable(EntryPool entryPool, long memoryBytes, int numStripes, boolean enablePrefetch) {
+        this(entryPool, memoryBytes, numStripes, enablePrefetch, 256, 0.75d);
+    }
+
+    public OffHeapHashTable(EntryPool entryPool, long memoryBytes, int numStripes, boolean enablePrefetch,
+            int initialCapacity, double loadFactor) {
         this.entryPool = entryPool;
         // Adjust numStripes to power of 2
         int powerOf2 = 1;
@@ -51,6 +58,8 @@ public class OffHeapHashTable implements AutoCloseable {
         this.stripeMask = powerOf2 - 1;
         this.stripeShift = 32 - shift;
         this.enablePrefetch = enablePrefetch;
+        this.initialCapacity = Math.max(2, nextPowerOfTwo(initialCapacity));
+        this.loadFactor = Math.max(0.25d, Math.min(loadFactor, 0.95d));
 
         this.tableAddrs = new long[powerOf2];
         this.tableMasks = new int[powerOf2];
@@ -61,7 +70,7 @@ public class OffHeapHashTable implements AutoCloseable {
 
         for (int i = 0; i < powerOf2; i++) {
             this.tableLocks[i] = new StampedLock();
-            int cap = 256; // Higher initial capacity
+            int cap = this.initialCapacity; // Configurable initial capacity
             MemorySegment seg = NativeMemory.calloc(cap, SLOT_SIZE);
             this.tableSegments[i] = seg;
             this.tableAddrs[i] = seg.address();
@@ -104,6 +113,30 @@ public class OffHeapHashTable implements AutoCloseable {
                 // Read fresh state under lock
                 return probeWithParams(tableAddrs[sIdx], tableMasks[sIdx], tableCapacities[sIdx], keyHash, keyBytes,
                         keyLen);
+            } finally {
+                lock.unlockRead(stamp);
+            }
+        }
+
+        return slot;
+    }
+
+    public int getWithKey(int keyHash, Object key, com.codeabbot.rmcache.serializer.KeySerializer serializer) {
+        int sIdx = (keyHash >>> stripeShift) & stripeMask;
+        StampedLock lock = tableLocks[sIdx];
+
+        long stamp = lock.tryOptimisticRead();
+        long tableAddr = tableAddrs[sIdx];
+        int mask = tableMasks[sIdx];
+        int cap = tableCapacities[sIdx];
+
+        int slot = probeWithKey(tableAddr, mask, cap, keyHash, key, serializer);
+
+        if (!lock.validate(stamp)) {
+            stamp = lock.readLock();
+            try {
+                return probeWithKey(tableAddrs[sIdx], tableMasks[sIdx], tableCapacities[sIdx], keyHash, key,
+                        serializer);
             } finally {
                 lock.unlockRead(stamp);
             }
@@ -159,12 +192,77 @@ public class OffHeapHashTable implements AutoCloseable {
         }
     }
 
+    private int probeWithKey(long tableAddr, int mask, int cap, int keyHash, Object key,
+            com.codeabbot.rmcache.serializer.KeySerializer serializer) {
+        int index = keyHash & mask;
+        int dist = 0;
+        int sameHashProbes = 0;
+
+        if (enablePrefetch) {
+            Prefetch.prefetchNextSlots(tableAddr, index, mask);
+        }
+
+        while (true) {
+            long entryAddr = tableAddr + ((long) index << 3);
+            long entry = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, entryAddr);
+
+            if (entry == 0L)
+                return 0;
+
+            if (enablePrefetch) {
+                Prefetch.prefetchNextSlots(tableAddr, index, mask, 1);
+            }
+
+            int storedHash = (int) (entry >>> 32);
+
+            if (storedHash == keyHash) {
+                int slot = (int) entry;
+                long offset = entryPool.getOffset(slot);
+                if (offset != -1L) {
+                    if (entryPool.matches(slot, key, serializer)) {
+                        return slot;
+                    }
+                }
+                if (++sameHashProbes >= MAX_SAME_HASH_PROBE) {
+                    return 0;
+                }
+            }
+
+            int ideal = storedHash & mask;
+            int probeDist = (index - ideal + cap) & mask;
+            if (probeDist < dist)
+                return 0;
+
+            index = (index + 1) & mask;
+            dist++;
+        }
+    }
+
     public int putWithLen(int keyHash, byte[] keyBytes, int keyLen, int slot) {
         int sIdx = (keyHash >>> stripeShift) & stripeMask;
         StampedLock lock = tableLocks[sIdx];
+
+        // Optimistic path: check if key exists first (for updates)
+        long optimisticStamp = lock.tryOptimisticRead();
+        if (optimisticStamp != 0L) {
+            long tableAddr = tableAddrs[sIdx];
+            int mask = tableMasks[sIdx];
+            int cap = tableCapacities[sIdx];
+
+            int existingSlot = probeWithParams(tableAddr, mask, cap, keyHash, keyBytes, keyLen);
+
+            // If key exists and optimistic read validates, this is an update
+            if (existingSlot > 0 && lock.validate(optimisticStamp)) {
+                // Key exists - this is an update, return the existing slot
+                // The caller will handle replacing the value in the entry pool
+                return existingSlot;
+            }
+        }
+
+        // Standard write path for new inserts or failed optimistic reads
         long stamp = lock.writeLock();
         try {
-            if (tableCounts[sIdx] >= (tableCapacities[sIdx] * 0.75)) {
+            if (tableCounts[sIdx] >= (int) (tableCapacities[sIdx] * loadFactor)) {
                 resize(sIdx);
             }
 
@@ -396,5 +494,15 @@ public class OffHeapHashTable implements AutoCloseable {
                 lock.unlockWrite(stamp);
             }
         }
+    }
+
+    private static int nextPowerOfTwo(int value) {
+        int v = value - 1;
+        v |= v >>> 1;
+        v |= v >>> 2;
+        v |= v >>> 4;
+        v |= v >>> 8;
+        v |= v >>> 16;
+        return v + 1;
     }
 }

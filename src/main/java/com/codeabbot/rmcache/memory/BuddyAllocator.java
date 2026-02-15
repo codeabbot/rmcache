@@ -1,13 +1,12 @@
 package com.codeabbot.rmcache.memory;
 
 import java.lang.foreign.MemorySegment;
-import java.util.BitSet;
-import java.util.LinkedHashSet;
-import java.util.Set;
+import java.lang.foreign.ValueLayout;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Buddy allocator for large allocations (> 64KB).
+ * Buddy allocator for large allocations (&gt; 64KB).
+ * Uses off-heap free lists and bitmap to avoid GC pressure at scale.
  *
  * @author Rabindra Meher
  */
@@ -21,15 +20,22 @@ class BuddyAllocator {
     private final int minOrder;
     private final int maxOrder;
 
-    // Free lists for each order: stored as offsets relative to baseOffset
-    private final Set<Long>[] freeLists;
+    /**
+     * Off-heap free list heads. Each entry is the relative offset of the first free
+     * block at that order, or -1L if empty. Free blocks store a 'next' pointer
+     * (relative offset or -1L) in their first 8 bytes within the data segment.
+     */
+    private final long[] freeListHeads;
 
-    // Status bits: true = allocated, false = free
-    private final BitSet allocatedMap;
+    /**
+     * Off-heap bitmap for allocated status. Each bit represents one minBlockSize
+     * chunk. Stored in a dedicated off-heap segment to avoid GC pressure.
+     */
+    private final MemorySegment bitmapSegment;
+    private final int bitmapLongs; // number of longs in bitmap
 
     private final ReentrantLock lock = new ReentrantLock();
 
-    @SuppressWarnings("unchecked")
     public BuddyAllocator(MemorySegment segment, long baseOffset, long capacity, int minBlockSize) {
         if (Long.bitCount(capacity) != 1) {
             throw new IllegalArgumentException("Capacity must be power of 2: " + capacity);
@@ -47,15 +53,21 @@ class BuddyAllocator {
         this.minOrder = Integer.numberOfTrailingZeros(minBlockSize);
         this.levels = maxOrder - minOrder + 1;
 
-        this.freeLists = new Set[levels];
+        // Off-heap free list heads (kept on heap — tiny array, levels is ~10-20)
+        this.freeListHeads = new long[levels];
         for (int i = 0; i < levels; i++) {
-            this.freeLists[i] = new LinkedHashSet<>();
+            this.freeListHeads[i] = -1L;
         }
 
-        this.allocatedMap = new BitSet((int) (capacity / minBlockSize));
+        // Off-heap bitmap: one bit per minBlockSize chunk
+        int totalChunks = (int) (capacity / minBlockSize);
+        this.bitmapLongs = (totalChunks + 63) >>> 6; // ceil(totalChunks / 64)
+        this.bitmapSegment = NativeMemory.calloc(bitmapLongs, 8); // zeroed = all free
 
         // Initially, one large block of max order is free
-        this.freeLists[levels - 1].add(0L);
+        this.freeListHeads[levels - 1] = 0L; // offset 0 relative to baseOffset
+        // Write -1L as the 'next' pointer for this single free block
+        segment.set(ValueLayout.JAVA_LONG, baseOffset, -1L);
     }
 
     public BuddyAllocator(MemorySegment segment, long baseOffset, long capacity) {
@@ -74,10 +86,11 @@ class BuddyAllocator {
         try {
             // Find smallest available block >= requested size
             for (int i = listIdx; i < levels; i++) {
-                if (!freeLists[i].isEmpty()) {
-                    // Remove block
-                    long offset = freeLists[i].iterator().next();
-                    freeLists[i].remove(offset);
+                if (freeListHeads[i] != -1L) {
+                    // Pop first block from free list
+                    long offset = freeListHeads[i];
+                    long nextFree = segment.get(ValueLayout.JAVA_LONG, baseOffset + offset);
+                    freeListHeads[i] = nextFree;
 
                     // Split until we reach required order
                     int currentIdx = i;
@@ -86,7 +99,10 @@ class BuddyAllocator {
                     while (currentIdx > listIdx) {
                         currentIdx--;
                         long buddyOffset = currentOffset + (1L << (currentIdx + minOrder));
-                        freeLists[currentIdx].add(buddyOffset);
+                        // Push buddy onto free list at currentIdx
+                        long oldHead = freeListHeads[currentIdx];
+                        segment.set(ValueLayout.JAVA_LONG, baseOffset + buddyOffset, oldHead);
+                        freeListHeads[currentIdx] = buddyOffset;
                     }
 
                     markAllocated(currentOffset, 1L << requiredOrder);
@@ -116,21 +132,62 @@ class BuddyAllocator {
                 long blockSize = 1L << (currentIdx + minOrder);
                 long buddyOffset = currentOffset ^ blockSize;
 
-                // Check if buddy is free in the current level's free list
-                if (freeLists[currentIdx].remove(buddyOffset)) {
-                    // Coalesce
-                    currentOffset = currentOffset & ~buddyOffset; // Take lower offset
+                // Check if buddy is free (not allocated)
+                if (!isBuddyAllocated(buddyOffset, blockSize)) {
+                    // Remove buddy from its free list
+                    removeFreeBlock(currentIdx, buddyOffset);
+                    // Coalesce — take the lower offset
+                    currentOffset = Math.min(currentOffset, buddyOffset);
                     currentIdx++;
                 } else {
                     break;
                 }
             }
 
-            // Add merged block to free list
-            freeLists[currentIdx].add(currentOffset);
+            // Push merged block onto free list
+            long oldHead = freeListHeads[currentIdx];
+            segment.set(ValueLayout.JAVA_LONG, baseOffset + currentOffset, oldHead);
+            freeListHeads[currentIdx] = currentOffset;
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Remove a specific block from the free list at the given level.
+     * This is an O(n) scan but buddy coalescing is rare relative to alloc/free.
+     */
+    private void removeFreeBlock(int level, long targetOffset) {
+        long prev = -1L;
+        long current = freeListHeads[level];
+
+        while (current != -1L) {
+            long next = segment.get(ValueLayout.JAVA_LONG, baseOffset + current);
+            if (current == targetOffset) {
+                if (prev == -1L) {
+                    freeListHeads[level] = next;
+                } else {
+                    segment.set(ValueLayout.JAVA_LONG, baseOffset + prev, next);
+                }
+                return;
+            }
+            prev = current;
+            current = next;
+        }
+    }
+
+    /**
+     * Check if all chunks in the buddy block are allocated.
+     */
+    private boolean isBuddyAllocated(long offset, long blockSize) {
+        int startBit = (int) (offset / minBlockSize);
+        int numBits = (int) (blockSize / minBlockSize);
+        for (int i = startBit; i < startBit + numBits; i++) {
+            if (isBitSet(i)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private int calculateOrder(long size) {
@@ -149,12 +206,42 @@ class BuddyAllocator {
     private void markAllocated(long offset, long size) {
         int startBit = (int) (offset / minBlockSize);
         int numBits = (int) (size / minBlockSize);
-        allocatedMap.set(startBit, startBit + numBits);
+        for (int i = startBit; i < startBit + numBits; i++) {
+            setBit(i);
+        }
     }
 
     private void markFree(long offset, long size) {
         int startBit = (int) (offset / minBlockSize);
         int numBits = (int) (size / minBlockSize);
-        allocatedMap.clear(startBit, startBit + numBits);
+        for (int i = startBit; i < startBit + numBits; i++) {
+            clearBit(i);
+        }
+    }
+
+    // --- Off-heap bitmap operations ---
+
+    private void setBit(int bitIndex) {
+        int longIdx = bitIndex >>> 6;
+        long mask = 1L << (bitIndex & 63);
+        long addr = (long) longIdx * 8L;
+        long val = bitmapSegment.get(ValueLayout.JAVA_LONG, addr);
+        bitmapSegment.set(ValueLayout.JAVA_LONG, addr, val | mask);
+    }
+
+    private void clearBit(int bitIndex) {
+        int longIdx = bitIndex >>> 6;
+        long mask = 1L << (bitIndex & 63);
+        long addr = (long) longIdx * 8L;
+        long val = bitmapSegment.get(ValueLayout.JAVA_LONG, addr);
+        bitmapSegment.set(ValueLayout.JAVA_LONG, addr, val & ~mask);
+    }
+
+    private boolean isBitSet(int bitIndex) {
+        int longIdx = bitIndex >>> 6;
+        long mask = 1L << (bitIndex & 63);
+        long addr = (long) longIdx * 8L;
+        long val = bitmapSegment.get(ValueLayout.JAVA_LONG, addr);
+        return (val & mask) != 0;
     }
 }

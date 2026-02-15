@@ -39,6 +39,69 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
      */
     boolean remove(K key);
 
+    /**
+     * Put a value only if the key is not already present.
+     * 
+     * @param key   the key
+     * @param value the value
+     * @return true if the value was inserted, false if key already existed
+     */
+    boolean putIfAbsent(K key, V value);
+
+    /**
+     * Put a value with TTL only if the key is not already present.
+     * 
+     * @param key   the key
+     * @param value the value
+     * @param ttl   time-to-live
+     * @return true if the value was inserted, false if key already existed
+     */
+    boolean putIfAbsent(K key, V value, Duration ttl);
+
+    /**
+     * Compute a value for the key if it's not already present.
+     * The loader function is called only if the key is absent.
+     * 
+     * @param key    the key
+     * @param loader function to compute the value
+     * @return the existing value if present, or the newly computed value
+     */
+    V computeIfAbsent(K key, Function<K, V> loader);
+
+    /**
+     * Compute a value with TTL for the key if it's not already present.
+     * 
+     * @param key    the key
+     * @param loader function to compute the value
+     * @param ttl    time-to-live for the computed value
+     * @return the existing value if present, or the newly computed value
+     */
+    V computeIfAbsent(K key, Function<K, V> loader, Duration ttl);
+
+    /**
+     * Put all entries from the map into the cache.
+     * 
+     * @param entries map of key-value pairs to insert
+     */
+    void putAll(java.util.Map<K, V> entries);
+
+    /**
+     * Put all entries from the map with a TTL.
+     * 
+     * @param entries map of key-value pairs to insert
+     * @param ttl     time-to-live for all entries
+     */
+    void putAll(java.util.Map<K, V> entries, Duration ttl);
+
+    /**
+     * Get all values for the given keys.
+     * Only returns entries that exist (non-null values).
+     * 
+     * @param keys collection of keys to retrieve
+     * @return map of found key-value pairs
+     */
+    java.util.Map<K, V> getAll(java.util.Collection<K> keys);
+
     /** Put a value into the cache asynchronously. */
     CompletableFuture<Void> putAsync(K key, V value);
 

@@ -6,3 +6,12 @@ build
 
 # Ignore Kotlin plugin data
 .kotlin
+/bin
+/lib
+bin
+lib
+.idea
+.DS_Store
+.vscode
+.agent
+.agent/*

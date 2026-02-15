@@ -4,7 +4,9 @@ import com.codeabbot.rmcache.CacheBuilder;
 import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
+import com.codeabbot.rmcache.GhostCacheMode;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
+import com.codeabbot.rmcache.util.MemoryEstimator;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
 import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
@@ -25,6 +27,7 @@ public class MemoryScalabilitySuite {
 
     private static final int KEY_SIZE = 16;
     private static final int VALUE_SIZE = 256;
+    private static final int NMA_PAGE_SIZE = 4096;
     private static final List<Integer> SCALES = List.of(10_000, 100_000, 1_000_000);
 
     public static void main(String[] args) {
@@ -47,11 +50,12 @@ public class MemoryScalabilitySuite {
                     .keySerializer(BuiltInSerializers.STRING_KEY)
                     .valueSerializer(BuiltInSerializers.byteArray())
                     .eviction(new NoEvictionPolicy())
+                    .ghostCacheMode(GhostCacheMode.OFF_HEAP)
                     .ghostCacheSize(8192)
                     .build());
             runMeasurement(scale, "NMA", count -> {
                 NativeMemoryAllocator allocator = new NativeMemoryAllocatorBuilder(
-                        4096,
+                        NMA_PAGE_SIZE,
                         Units.gigabytes(4),
                         false).build();
                 return NMAFactory.createMap(
@@ -92,9 +96,10 @@ public class MemoryScalabilitySuite {
             usedOffHeap = ((OffHeapCache<?, ?>) cache).getStats().memoryUsedBytes();
         } else {
             // NMA doesn't expose total used memory easily in this version,
-            // estimating based on (Key+Value+Header) * count.
-            // NMA typically has ~32 bytes overhead per entry off-heap.
-            usedOffHeap = count * (long) (KEY_SIZE + VALUE_SIZE + 32);
+            // estimating based on fixed page allocations per entry.
+            MemoryEstimator.NmaEstimate estimate = MemoryEstimator.estimateNma(
+                    count, KEY_SIZE, VALUE_SIZE, NMA_PAGE_SIZE, 32);
+            usedOffHeap = estimate.offHeapBytes();
         }
 
         long totalBytes = usedHeap + usedOffHeap;
@@ -123,20 +128,28 @@ public class MemoryScalabilitySuite {
         System.out
                 .println("------------------------------------------------------------------------------------------");
 
-        // RMCache: 16B/slot HT + 32B meta + Data. Zero-Heap Index.
-        // 1B Entries -> HT: 16GB. Meta: 32GB. Data: 256GB.
-        // Total Off-Heap: ~304 GB. Heap: < 50 MB.
-        System.out.println(String.format("%-12s | %-18s | %-18s | %-15s", "RMCache", "~50 MB", "~304 GB", "304.1 GB"));
+        MemoryEstimator.MemoryEstimate rmEstimate = MemoryEstimator.estimate(
+                1_000_000_000L,
+                KEY_SIZE,
+                VALUE_SIZE,
+                8192,
+                256,
+                MemoryEstimator.DEFAULT_LOAD_FACTOR,
+                8192,
+                GhostCacheMode.OFF_HEAP,
+                MemoryEstimator.DEFAULT_ALLOCATOR_OVERHEAD_RATIO);
+        double rmOffHeapGb = rmEstimate.totalBytes() / 1024.0 / 1024.0 / 1024.0;
+        System.out.println(String.format("%-12s | %-18s | %-18.1f GB | %-15.1f GB",
+                "RMCache", "< 50 MB", rmOffHeapGb, rmOffHeapGb));
 
-        // NMA: Uses CHM on Heap.
-        // Per-entry heap: Node + Key + Handle = ~80 bytes.
-        // 1B Entries -> 80 GB HEAP.
-        // Off-Heap: Data (256 GB) + Overhead (~32 GB) = 288 GB.
-        // Total RAM: ~368 GB.
-        System.out.println(String.format("%-12s | %-18s | %-18s | %-15s", "NMA", "~80.0 GB", "~288 GB", "368.0 GB"));
+        MemoryEstimator.NmaEstimate nmaEstimate = MemoryEstimator.estimateNma(
+                1_000_000_000L, KEY_SIZE, VALUE_SIZE, NMA_PAGE_SIZE, 32);
+        double nmaOffHeapGb = nmaEstimate.offHeapBytes() / 1024.0 / 1024.0 / 1024.0;
+        System.out.println(String.format("%-12s | %-18s | %-18.1f GB | %-15.1f GB",
+                "NMA", "High (CHM)", nmaOffHeapGb, nmaOffHeapGb));
         System.out
                 .println("------------------------------------------------------------------------------------------");
-        System.out.println("  Critical Advantage: RMCache saves > 79 GB of Java Heap at 1B scale.");
+        System.out.println("  Critical Advantage: RMCache avoids massive on-heap CHM overhead at 1B scale.");
         System.out.println(
                 "==========================================================================================\n");
     }

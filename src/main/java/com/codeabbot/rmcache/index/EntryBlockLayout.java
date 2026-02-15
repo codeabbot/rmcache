@@ -7,7 +7,9 @@ public class EntryBlockLayout {
     private EntryBlockLayout() {
     }
 
-    public static final int HEADER_SIZE = 24;
+    public static final int HEADER_SIZE = 20;
+    /** Offset to the start of key bytes = HEADER_SIZE + sizeof(keyLen:4). */
+    public static final int DATA_OFFSET = HEADER_SIZE + 4;
 
     public static int pad(int len) {
         return (len + 3) & ~3;

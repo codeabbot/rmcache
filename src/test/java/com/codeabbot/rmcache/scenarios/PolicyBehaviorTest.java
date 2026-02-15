@@ -34,6 +34,7 @@ public class PolicyBehaviorTest {
                 .offHeapMemory(1024 * 1024)
                 .maxEntries(10) // Small limit
                 .ghostCacheSize(0)
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         for (int i = 0; i < 15; i++) {

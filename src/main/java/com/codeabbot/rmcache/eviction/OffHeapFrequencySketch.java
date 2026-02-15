@@ -19,11 +19,13 @@ class OffHeapFrequencySketch implements AutoCloseable {
 
     private static final long RESET_MASK = 0x7777777777777777L;
 
+    private static final int MAX_TABLE_SIZE = 1 << 24; // 16M entries = 128 MB max
+
     public OffHeapFrequencySketch(int expectedSize) {
-        int size = ceilingPowerOfTwo(Math.max(expectedSize, 1));
+        int size = Math.min(ceilingPowerOfTwo(Math.max(expectedSize, 1)), MAX_TABLE_SIZE);
         this.tableSize = size;
         this.tableMask = size - 1;
-        this.resetThreshold = expectedSize * 10;
+        this.resetThreshold = size * 10;
         this.table = NativeMemory.calloc(size, ValueLayout.JAVA_LONG.byteSize());
     }
 

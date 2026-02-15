@@ -106,6 +106,7 @@ public class MemoryAnalysisTest {
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .offHeapMemory(1024 * 1024)
                 .maxEntries(1000) // Small entry limit
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         // Insert 1500 items (should trigger eviction)

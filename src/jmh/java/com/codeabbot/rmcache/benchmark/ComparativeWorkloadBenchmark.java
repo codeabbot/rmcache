@@ -1,10 +1,12 @@
 package com.codeabbot.rmcache.benchmark;
 
 import com.codeabbot.rmcache.CacheBuilder;
+import com.codeabbot.rmcache.GhostCacheMode;
 import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
+import com.codeabbot.rmcache.serializer.StringEncoding;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
 import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
@@ -59,10 +61,12 @@ public class ComparativeWorkloadBenchmark {
         rmcache = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(8))
                 .maxEntries(entryCount * 2)
-                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
-                .ghostCacheSize(8192) // Enable L1 cache
+                .hashTableLoadFactor(0.5d)
+                .ghostCacheMode(GhostCacheMode.DISABLED)
+                .ghostCacheSize(0)
                 .build();
 
         // NMA Setup

@@ -1,10 +1,12 @@
 package com.codeabbot.rmcache.benchmark;
 
 import com.codeabbot.rmcache.CacheBuilder;
+import com.codeabbot.rmcache.GhostCacheMode;
 import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
+import com.codeabbot.rmcache.serializer.StringEncoding;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
 import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
 import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
@@ -12,6 +14,7 @@ import com.target.nativememoryallocator.map.NativeMemoryMap;
 import com.target.nativememoryallocator.map.NativeMemoryMapBackend;
 import com.target.nativememoryallocator.map.NativeMemoryMapBuilder;
 import com.target.nativememoryallocator.map.NativeMemoryMapSerializer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.openjdk.jmh.annotations.*;
 
 import java.util.concurrent.ThreadLocalRandom;
@@ -41,6 +44,7 @@ public class FairComparisonScaleBenchmark {
     public int valueSize = 256;
 
     private OffHeapCache<String, byte[]> rmcache;
+    private OffHeapCache<String, byte[]> rmcacheGhost; // with OFF_HEAP GhostCache
     private NativeMemoryMap<String, byte[]> nmaMap;
     private org.ehcache.Cache<String, byte[]> ehcache;
     private CacheManager ehcacheManager;
@@ -49,15 +53,31 @@ public class FairComparisonScaleBenchmark {
     public void setup() {
         System.out.println("\nSetup scale test for " + entryCount + " entries...");
 
-        // RMCache with GhostCache enabled + NO eviction (fair comparison)
-        // Allocate 8GB to handle 10M entries + metadata comfortably
+        // RMCache without GhostCache (random access) + NO eviction (fair comparison)
+        // Allocate 8GB to handle 1M+ entries + metadata comfortably
         rmcache = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(8))
                 .maxEntries(entryCount * 2) // Handle 1M entries comfortably
-                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
-                .ghostCacheSize(8192) // L1 cache for hot keys
+                .hashTableLoadFactor(0.5d)
+                .ghostCacheMode(GhostCacheMode.DISABLED)
+                .ghostCacheSize(0)
+                .withMeterRegistry(new SimpleMeterRegistry())
+                .withCacheName("benchmark")
+                .build();
+
+        // RMCache WITH OFF_HEAP GhostCache
+        rmcacheGhost = new CacheBuilder<String, byte[]>()
+                .offHeapMemory(Units.gigabytes(8))
+                .maxEntries(entryCount * 2)
+                .stringKeyEncoding(StringEncoding.LATIN1)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .eviction(new NoEvictionPolicy())
+                .hashTableLoadFactor(0.5d)
+                .ghostCacheMode(GhostCacheMode.OFF_HEAP)
+                .ghostCacheSize(8192)
                 .build();
 
         // NMA allocator + Map (Using 8GB as requested to prevent breaking)
@@ -87,6 +107,7 @@ public class FairComparisonScaleBenchmark {
         for (int i = 0; i < entryCount; i++) {
             String key = "key-" + i;
             rmcache.put(key, value);
+            rmcacheGhost.put(key, value);
             nmaMap.put(key, value);
             ehcache.put(key, value);
             if (i > 0 && i % 1_000_000 == 0) {
@@ -100,6 +121,9 @@ public class FairComparisonScaleBenchmark {
     public void tearDown() {
         if (rmcache != null) {
             rmcache.close();
+        }
+        if (rmcacheGhost != null) {
+            rmcacheGhost.close();
         }
         if (ehcacheManager != null) {
             ehcacheManager.close();
@@ -115,6 +139,12 @@ public class FairComparisonScaleBenchmark {
     }
 
     @Benchmark
+    public byte[] rmcacheGhostGet() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return rmcacheGhost.get("key-" + idx);
+    }
+
+    @Benchmark
     public byte[] nmaGet() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
         return nmaMap.get("key-" + idx);
@@ -127,6 +157,13 @@ public class FairComparisonScaleBenchmark {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
         byte[] value = new byte[valueSize];
         rmcache.put("key-" + idx, value);
+    }
+
+    @Benchmark
+    public void rmcacheGhostPut() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        byte[] value = new byte[valueSize];
+        rmcacheGhost.put("key-" + idx, value);
     }
 
     @Benchmark

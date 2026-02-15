@@ -8,7 +8,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * High-performance SLRU + TinyLFU policy with Async Maintenance.
+ * High-performance SLRU + TinyLFU policy with Async Maintenance
+ * and Striped LRU Locking for reduced contention at scale.
  *
  * @author Rabindra Meher
  */
@@ -21,17 +22,28 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
     private final int protectedSize;
     private final int probationSize;
 
-    private OffHeapCompactLRU lru;
-    private OffHeapFrequencySketch frequencySketch;
-    private final ReentrantLock lock = new ReentrantLock();
+    // Striped LRU: N shards, each with its own lock and LRU lists
+    private final int shardCount;
+    private final int shardMask;
+    private OffHeapCompactLRU[] shards;
+    private final ReentrantLock[] shardLocks;
+    private final int windowPerShard;
+    private final int protectedPerShard;
 
+    private OffHeapFrequencySketch frequencySketch;
+
+    // Async access buffers (unchanged from before)
     private final int numStripes;
-    private final int bufferSize = 1024;
+    private final int stripeMask;
+    private final int bufferSize = 4096;
     private final int[][] buffers;
     private final AtomicInteger[] bufferIndices;
 
     private final AtomicInteger _size = new AtomicInteger(0);
     private Runnable maintenanceCallback;
+
+    // Round-robin counter for victim selection across shards
+    private final AtomicInteger victimShardCounter = new AtomicInteger(0);
 
     private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "rmcache-lru-maintenance");
@@ -45,10 +57,28 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         this.protectedSize = (int) (maxEntries * protectedPercent);
         this.probationSize = maxEntries - windowSize - protectedSize;
 
-        this.lru = new OffHeapCompactLRU(maxSlots);
+        // Determine shard count: power of 2, between 4 and 64
+        int rawShards = Math.max(Runtime.getRuntime().availableProcessors(), 4);
+        this.shardCount = Math.min(Integer.highestOneBit(rawShards), 64);
+        this.shardMask = this.shardCount - 1;
+
+        // Per-shard size caps (distribute evenly, rounding up for safety)
+        this.windowPerShard = Math.max((windowSize + shardCount - 1) / shardCount, 1);
+        this.protectedPerShard = Math.max((protectedSize + shardCount - 1) / shardCount, 1);
+
+        // Initialize shards - each shard handles maxSlots (slots are sparse)
+        this.shards = new OffHeapCompactLRU[shardCount];
+        this.shardLocks = new ReentrantLock[shardCount];
+        for (int i = 0; i < shardCount; i++) {
+            shards[i] = new OffHeapCompactLRU(maxSlots);
+            shardLocks[i] = new ReentrantLock();
+        }
+
         this.frequencySketch = new OffHeapFrequencySketch(maxSlots);
 
-        this.numStripes = Math.max(Runtime.getRuntime().availableProcessors() * 4, 16);
+        int rawStripes = Math.max(Runtime.getRuntime().availableProcessors() * 4, 16);
+        this.numStripes = Integer.highestOneBit(rawStripes);
+        this.stripeMask = this.numStripes - 1;
         this.buffers = new int[numStripes][bufferSize];
         this.bufferIndices = new AtomicInteger[numStripes];
         for (int i = 0; i < numStripes; i++) {
@@ -66,16 +96,21 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         this.maintenanceCallback = callback;
     }
 
+    private int shardFor(int slot) {
+        return slot & shardMask;
+    }
+
     @Override
     public void setEntryPool(EntryPool pool) {
         this.entryPool = pool;
-        if (pool.slotCapacity() > lru.capacity) {
+        if (pool.slotCapacity() > shards[0].capacity) {
             int newCap = pool.slotCapacity();
-            // Free old before allocating new to save space
-            lru.close();
+            // Free old before allocating new
+            for (int i = 0; i < shardCount; i++) {
+                shards[i].close();
+                shards[i] = new OffHeapCompactLRU(newCap);
+            }
             frequencySketch.close();
-
-            this.lru = new OffHeapCompactLRU(newCap);
             this.frequencySketch = new OffHeapFrequencySketch(newCap);
         }
     }
@@ -87,7 +122,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
         frequencySketch.increment(keyHash);
 
-        int stripe = (int) (Thread.currentThread().getId() % numStripes);
+        int stripe = (int) (Thread.currentThread().getId() & stripeMask);
         int idx = bufferIndices[stripe].getAndIncrement();
         if (idx < bufferSize) {
             buffers[stripe][idx] = slot;
@@ -99,57 +134,64 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
     @Override
     public void onAdd(int slot, int keyHash, short priority) {
         frequencySketch.increment(keyHash);
-        lock.lock();
+        int shard = shardFor(slot);
+        shardLocks[shard].lock();
         try {
-            lru.addToWindow(slot);
+            shards[shard].addToWindow(slot);
             _size.incrementAndGet();
 
-            if (lru.windowSize > windowSize) {
-                int victim = lru.pollWindow();
+            if (shards[shard].windowSize > windowPerShard) {
+                int victim = shards[shard].pollWindow();
                 if (victim != 0) {
-                    lru.addToProbation(victim);
+                    shards[shard].addToProbation(victim);
                 }
             }
         } finally {
-            lock.unlock();
+            shardLocks[shard].unlock();
         }
     }
 
     @Override
     public void onRemove(int slot) {
-        lock.lock();
+        int shard = shardFor(slot);
+        shardLocks[shard].lock();
         try {
-            if (lru.remove(slot)) {
+            if (shards[shard].remove(slot)) {
                 _size.decrementAndGet();
             }
         } finally {
-            lock.unlock();
+            shardLocks[shard].unlock();
         }
     }
 
     @Override
     public int selectVictim() {
-        lock.lock();
-        try {
-            if (lru.probationSize > 0) {
-                int victim = lru.pollProbation();
-                _size.decrementAndGet();
-                return victim;
+        // Round-robin across shards to find a victim
+        int startShard = victimShardCounter.getAndIncrement() & shardMask;
+        for (int i = 0; i < shardCount; i++) {
+            int shard = (startShard + i) & shardMask;
+            shardLocks[shard].lock();
+            try {
+                if (shards[shard].probationSize > 0) {
+                    int victim = shards[shard].pollProbation();
+                    _size.decrementAndGet();
+                    return victim;
+                }
+                if (shards[shard].protectedSize > 0) {
+                    int victim = shards[shard].pollProtected();
+                    _size.decrementAndGet();
+                    return victim;
+                }
+                if (shards[shard].windowSize > 0) {
+                    int victim = shards[shard].pollWindow();
+                    _size.decrementAndGet();
+                    return victim;
+                }
+            } finally {
+                shardLocks[shard].unlock();
             }
-            if (lru.protectedSize > 0) {
-                int victim = lru.pollProtected();
-                _size.decrementAndGet();
-                return victim;
-            }
-            if (lru.windowSize > 0) {
-                int victim = lru.pollWindow();
-                _size.decrementAndGet();
-                return victim;
-            }
-            return 0;
-        } finally {
-            lock.unlock();
         }
+        return 0;
     }
 
     @Override
@@ -159,19 +201,23 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public void drainBuffers() {
-        if (lock.tryLock()) {
-            try {
-                for (int stripe = 0; stripe < numStripes; stripe++) {
-                    int count = Math.min(bufferIndices[stripe].getAndSet(0), bufferSize);
-                    for (int i = 0; i < count; i++) {
-                        int slot = buffers[stripe][i];
-                        if (slot != 0)
-                            promote(slot);
-                        buffers[stripe][i] = 0;
+        for (int stripe = 0; stripe < numStripes; stripe++) {
+            int count = Math.min(bufferIndices[stripe].getAndSet(0), bufferSize);
+            if (count == 0)
+                continue;
+
+            for (int i = 0; i < count; i++) {
+                int slot = buffers[stripe][i];
+                if (slot != 0) {
+                    int shard = shardFor(slot);
+                    shardLocks[shard].lock();
+                    try {
+                        promote(slot, shard);
+                    } finally {
+                        shardLocks[shard].unlock();
                     }
                 }
-            } finally {
-                lock.unlock();
+                buffers[stripe][i] = 0;
             }
         }
 
@@ -180,21 +226,21 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         }
     }
 
-    private void promote(int slot) {
-        int segment = lru.getSegment(slot);
+    private void promote(int slot, int shard) {
+        int segment = shards[shard].getSegment(slot);
         switch (segment) {
             case OffHeapCompactLRU.PROBATION -> {
-                lru.removeProbation(slot);
-                lru.addToProtected(slot);
+                shards[shard].removeProbation(slot);
+                shards[shard].addToProtected(slot);
 
-                if (lru.protectedSize > protectedSize) {
-                    int demoted = lru.pollProtected();
+                if (shards[shard].protectedSize > protectedPerShard) {
+                    int demoted = shards[shard].pollProtected();
                     if (demoted != 0)
-                        lru.addToProbation(demoted);
+                        shards[shard].addToProbation(demoted);
                 }
             }
-            case OffHeapCompactLRU.PROTECTED -> lru.moveToHead(slot, OffHeapCompactLRU.PROTECTED);
-            case OffHeapCompactLRU.WINDOW -> lru.moveToHead(slot, OffHeapCompactLRU.WINDOW);
+            case OffHeapCompactLRU.PROTECTED -> shards[shard].moveToHead(slot, OffHeapCompactLRU.PROTECTED);
+            case OffHeapCompactLRU.WINDOW -> shards[shard].moveToHead(slot, OffHeapCompactLRU.WINDOW);
         }
     }
 
@@ -216,9 +262,10 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        // Free native memory
-        if (lru != null)
-            lru.close();
+        for (int i = 0; i < shardCount; i++) {
+            if (shards[i] != null)
+                shards[i].close();
+        }
         if (frequencySketch != null)
             frequencySketch.close();
     }

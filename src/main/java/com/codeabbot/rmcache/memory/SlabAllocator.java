@@ -7,6 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -38,10 +39,9 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
     private final Map<Long, Integer> largeAllocations = new ConcurrentHashMap<>();
     private final ReentrantLock largeLock = new ReentrantLock();
 
-    private final AtomicLong allocationCount = new AtomicLong(0);
-    private final AtomicLong freeCount = new AtomicLong(0);
+    private final LongAdder allocationCount = new LongAdder();
+    private final LongAdder freeCount = new LongAdder();
     private final AtomicLong usedBytesCounter = new AtomicLong(0);
-
 
     public MemorySegment getSegment() {
         return segment;
@@ -111,7 +111,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         if (active != null) {
             long offset = active.allocate();
             if (offset >= 0) {
-                allocationCount.incrementAndGet();
+                allocationCount.add(1);
                 usedBytesCounter.addAndGet(blockSize);
                 return new AllocationHandle(segment, offset, blockSize, classIndex);
             }
@@ -124,7 +124,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             if (currentActive != null) {
                 long offset = currentActive.allocate();
                 if (offset >= 0) {
-                    allocationCount.incrementAndGet();
+                    allocationCount.add(1);
                     usedBytesCounter.addAndGet(blockSize);
                     return new AllocationHandle(segment, offset, blockSize, classIndex);
                 }
@@ -151,7 +151,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             if (state.activeSlab.compareAndSet(null, replacement)) {
                 long offset = replacement.allocate();
                 if (offset >= 0) {
-                    allocationCount.incrementAndGet();
+                    allocationCount.add(1);
                     usedBytesCounter.addAndGet(blockSize);
                     return new AllocationHandle(segment, offset, blockSize, classIndex);
                 }
@@ -172,7 +172,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
                 throw new IllegalStateException("OOM Large");
             }
             largeAllocations.put(offset, sizeBytes);
-            allocationCount.incrementAndGet();
+            allocationCount.add(1);
             usedBytesCounter.addAndGet(sizeBytes);
             return new AllocationHandle(segment, offset, sizeBytes, -1);
         } finally {
@@ -182,7 +182,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
     @Override
     public void free(AllocationHandle handle) {
-        freeCount.incrementAndGet();
+        freeCount.add(1);
         if (handle.isLarge()) {
             freeLarge(handle);
             return;
@@ -218,18 +218,130 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         }
     }
 
-    private int findSizeClass(int size) {
-        for (int i = 0; i < SIZE_CLASSES.length; i++) {
-            if (size <= SIZE_CLASSES[i]) {
-                return i;
+    /**
+     * Allocate and return a packed long handle (no object allocation).
+     * Returns -1L if allocation fails.
+     */
+    public long allocatePacked(int sizeBytes) {
+        if (sizeBytes <= 0) {
+            throw new IllegalArgumentException("Size must be positive");
+        }
+        int classIndex = findSizeClass(sizeBytes);
+
+        if (classIndex < 0 || sizeBytes > LARGE_THRESHOLD) {
+            // Fall back to object-based path for large allocations (rare)
+            AllocationHandle h = allocateLarge(sizeBytes);
+            return AllocationHandle.pack(h.getOffset(), h.getCapacity(), h.getSizeClass());
+        }
+
+        int blockSize = SIZE_CLASSES[classIndex];
+        SizeClassState state = classStates[classIndex];
+
+        // 1. Try active slab
+        LockFreeSlabManager active = state.activeSlab.get();
+        if (active != null) {
+            long offset = active.allocate();
+            if (offset >= 0) {
+                allocationCount.add(1);
+                usedBytesCounter.addAndGet(blockSize);
+                return AllocationHandle.pack(offset, blockSize, classIndex);
             }
         }
-        return -1;
+
+        // 2. Slow path
+        while (true) {
+            LockFreeSlabManager currentActive = state.activeSlab.get();
+            if (currentActive != null) {
+                long offset = currentActive.allocate();
+                if (offset >= 0) {
+                    allocationCount.add(1);
+                    usedBytesCounter.addAndGet(blockSize);
+                    return AllocationHandle.pack(offset, blockSize, classIndex);
+                }
+                state.activeSlab.compareAndSet(currentActive, null);
+            }
+
+            LockFreeSlabManager replacement = state.partialSlabs.poll();
+            if (replacement == null) {
+                long newOffset = nextSlabOffset.getAndAdd(slabSize);
+                if (newOffset + slabSize > slabRegionSize) {
+                    return -1L;
+                }
+                replacement = new LockFreeSlabManager(segment, newOffset, blockSize, slabSize);
+                int slabIdx = (int) (newOffset / slabSize);
+                if (slabIdx < slabDirectory.length) {
+                    slabDirectory[slabIdx] = replacement;
+                } else {
+                    return -1L;
+                }
+            }
+
+            if (state.activeSlab.compareAndSet(null, replacement)) {
+                long offset = replacement.allocate();
+                if (offset >= 0) {
+                    allocationCount.add(1);
+                    usedBytesCounter.addAndGet(blockSize);
+                    return AllocationHandle.pack(offset, blockSize, classIndex);
+                }
+            } else {
+                state.partialSlabs.offer(replacement);
+            }
+        }
+    }
+
+    /**
+     * Free using a packed long handle (no object allocation).
+     */
+    public void freePacked(long packedHandle) {
+        freeCount.add(1);
+        int sc = AllocationHandle.unpackSizeClass(packedHandle);
+        long offset = AllocationHandle.unpackOffset(packedHandle);
+
+        if (sc < 0) {
+            // Large allocation
+            largeLock.lock();
+            try {
+                Integer size = largeAllocations.remove(offset);
+                if (size != null) {
+                    usedBytesCounter.addAndGet(-size);
+                    buddyAllocator.free(offset, size);
+                }
+            } finally {
+                largeLock.unlock();
+            }
+            return;
+        }
+
+        int blockSize = SIZE_CLASSES[sc];
+        int slabIdx = (int) (offset / slabSize);
+        LockFreeSlabManager slab = slabDirectory[slabIdx];
+        if (slab == null) {
+            throw new IllegalStateException("Freeing pointer to unknown slab");
+        }
+
+        boolean wasFull = slab.isFull();
+        if (slab.free(offset)) {
+            usedBytesCounter.addAndGet(-blockSize);
+            if (wasFull) {
+                classStates[sc].partialSlabs.offer(slab);
+            }
+        }
+    }
+
+    private int findSizeClass(int size) {
+        if (size <= 64)
+            return 0;
+        if (size > LARGE_THRESHOLD)
+            return -1;
+        // Round up to next power of 2
+        int powerOf2 = Integer.highestOneBit(size - 1) << 1;
+        // SIZE_CLASSES[0] = 64 = 2^6, so subtract 6 from trailing zeros
+        return Integer.numberOfTrailingZeros(powerOf2) - 6;
     }
 
     @Override
     public AllocatorStats stats() {
-        return new AllocatorStats(totalBytes, getUsedBytes(), getFreeBytes(), allocationCount.get(), freeCount.get(),
+        return new AllocatorStats(totalBytes, getUsedBytes(), getFreeBytes(), allocationCount.sum(), freeCount.sum(),
                 Collections.emptyList());
     }
 

@@ -23,7 +23,7 @@ public final class BuiltInSerializers {
         return ByteArrayValueSerializer.INSTANCE;
     }
 
-    public static final class StringKeySerializer implements KeySerializer<String> {
+    public static final class StringKeySerializer implements FastKeySerializer<String> {
         private final java.nio.charset.Charset charset;
         private final boolean latin1FastPath;
 
@@ -52,7 +52,7 @@ public final class BuiltInSerializers {
         }
 
         @Override
-        public boolean matches(String key, MemorySegment segment, long offset, int length) {
+        public boolean matchesFast(String key, MemorySegment segment, long offset, int length) {
             if (latin1FastPath) {
                 if (length != key.length()) {
                     return false;
@@ -90,7 +90,7 @@ public final class BuiltInSerializers {
         }
     };
 
-    public static final KeySerializer<Integer> INT_KEY = new KeySerializer<>() {
+    public static final FastKeySerializer<Integer> INT_KEY = new FastKeySerializer<>() {
         @Override
         public byte[] serialize(Integer key) {
             int v = key;
@@ -115,6 +115,17 @@ public final class BuiltInSerializers {
         @Override
         public int hashCode(Integer key) {
             return key;
+        }
+
+        @Override
+        public boolean matchesFast(Integer key, MemorySegment segment, long offset, int length) {
+            if (length != 4)
+                return false;
+            int v = key;
+            return segment.get(ValueLayout.JAVA_BYTE, offset) == (byte) (v >>> 24)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 1) == (byte) (v >>> 16)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 2) == (byte) (v >>> 8)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 3) == (byte) v;
         }
     };
 
@@ -141,7 +152,7 @@ public final class BuiltInSerializers {
         }
     };
 
-    public static final KeySerializer<Long> LONG_KEY = new KeySerializer<>() {
+    public static final FastKeySerializer<Long> LONG_KEY = new FastKeySerializer<>() {
         @Override
         public byte[] serialize(Long key) {
             long v = key;
@@ -174,6 +185,21 @@ public final class BuiltInSerializers {
         @Override
         public int hashCode(Long key) {
             return (int) (key ^ (key >>> 32));
+        }
+
+        @Override
+        public boolean matchesFast(Long key, MemorySegment segment, long offset, int length) {
+            if (length != 8)
+                return false;
+            long v = key;
+            return segment.get(ValueLayout.JAVA_BYTE, offset) == (byte) (v >>> 56)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 1) == (byte) (v >>> 48)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 2) == (byte) (v >>> 40)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 3) == (byte) (v >>> 32)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 4) == (byte) (v >>> 24)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 5) == (byte) (v >>> 16)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 6) == (byte) (v >>> 8)
+                    && segment.get(ValueLayout.JAVA_BYTE, offset + 7) == (byte) v;
         }
     };
 
@@ -208,7 +234,7 @@ public final class BuiltInSerializers {
         }
     };
 
-    public static final KeySerializer<byte[]> BYTE_ARRAY_KEY = new KeySerializer<>() {
+    public static final FastKeySerializer<byte[]> BYTE_ARRAY_KEY = new FastKeySerializer<>() {
         @Override
         public byte[] serialize(byte[] key) {
             return key;
@@ -222,6 +248,18 @@ public final class BuiltInSerializers {
         @Override
         public int hashCode(byte[] key) {
             return Arrays.hashCode(key);
+        }
+
+        @Override
+        public boolean matchesFast(byte[] key, MemorySegment segment, long offset, int length) {
+            if (key.length != length)
+                return false;
+            for (int i = 0; i < length; i++) {
+                if (segment.get(ValueLayout.JAVA_BYTE, offset + i) != key[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
     };
 

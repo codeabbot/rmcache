@@ -6,7 +6,8 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * Off-Heap implementation of CompactLRU (SLRU policy).
- * Stores next/prev pointers and segment flags in native memory.
+ * Stores next/prev pointers in native memory, with segment flags packed
+ * into the top 2 bits of the next pointer (saves 1 byte per entry).
  * 
  * @author Rabindra Meher
  */
@@ -16,12 +17,16 @@ public class OffHeapCompactLRU implements AutoCloseable {
     static final int PROBATION = 2;
     static final int PROTECTED = 3;
 
+    // Segment is packed into top 2 bits of next[slot]
+    // Next pointer uses lower 30 bits (supports up to ~1B slots)
+    private static final int NEXT_MASK = 0x3FFF_FFFF; // lower 30 bits
+    private static final int SEG_SHIFT = 30;
+
     final int capacity;
 
-    // Native memory segments
-    private final MemorySegment next;
+    // Native memory — segment byte array eliminated by packing into next
+    private final MemorySegment next; // top 2 bits = segment, lower 30 bits = next pointer
     private final MemorySegment prev;
-    private final MemorySegment segment;
 
     int headWindow = NONE;
     int tailWindow = NONE;
@@ -37,34 +42,37 @@ public class OffHeapCompactLRU implements AutoCloseable {
 
     public OffHeapCompactLRU(int capacity) {
         this.capacity = capacity;
-        // Allocate native memory for arrays (1-based indexing, so capacity + 1)
         long size = capacity + 1;
         this.next = NativeMemory.calloc(size, ValueLayout.JAVA_INT.byteSize());
         this.prev = NativeMemory.calloc(size, ValueLayout.JAVA_INT.byteSize());
-        this.segment = NativeMemory.calloc(size, ValueLayout.JAVA_BYTE.byteSize());
     }
 
     @Override
     public void close() {
         NativeMemory.free(next);
         NativeMemory.free(prev);
-        NativeMemory.free(segment);
     }
 
     public int getSegment(int slot) {
-        return segment.get(ValueLayout.JAVA_BYTE, slot);
+        int raw = next.get(ValueLayout.JAVA_INT, (long) slot * 4);
+        return raw >>> SEG_SHIFT;
     }
 
     private void setSegment(int slot, int value) {
-        segment.set(ValueLayout.JAVA_BYTE, slot, (byte) value);
+        int raw = next.get(ValueLayout.JAVA_INT, (long) slot * 4);
+        int nextVal = raw & NEXT_MASK;
+        next.set(ValueLayout.JAVA_INT, (long) slot * 4, nextVal | (value << SEG_SHIFT));
     }
 
     private int getNext(int slot) {
-        return next.get(ValueLayout.JAVA_INT, (long) slot * 4);
+        int raw = next.get(ValueLayout.JAVA_INT, (long) slot * 4);
+        return raw & NEXT_MASK;
     }
 
     private void setNext(int slot, int value) {
-        next.set(ValueLayout.JAVA_INT, (long) slot * 4, value);
+        int raw = next.get(ValueLayout.JAVA_INT, (long) slot * 4);
+        int seg = raw & ~NEXT_MASK;
+        next.set(ValueLayout.JAVA_INT, (long) slot * 4, seg | (value & NEXT_MASK));
     }
 
     private int getPrev(int slot) {
@@ -107,9 +115,9 @@ public class OffHeapCompactLRU implements AutoCloseable {
             setPrev(n, p);
         else
             tailWindow = p;
-        setNext(slot, NONE);
+        // Clear both next pointer and segment bits
+        next.set(ValueLayout.JAVA_INT, (long) slot * 4, 0);
         setPrev(slot, NONE);
-        setSegment(slot, 0);
         windowSize--;
     }
 
@@ -145,9 +153,8 @@ public class OffHeapCompactLRU implements AutoCloseable {
             setPrev(n, p);
         else
             tailProbation = p;
-        setNext(slot, NONE);
+        next.set(ValueLayout.JAVA_INT, (long) slot * 4, 0);
         setPrev(slot, NONE);
-        setSegment(slot, 0);
         probationSize--;
     }
 
@@ -183,9 +190,8 @@ public class OffHeapCompactLRU implements AutoCloseable {
             setPrev(n, p);
         else
             tailProtected = p;
-        setNext(slot, NONE);
+        next.set(ValueLayout.JAVA_INT, (long) slot * 4, 0);
         setPrev(slot, NONE);
-        setSegment(slot, 0);
         protectedSize--;
     }
 
@@ -205,7 +211,6 @@ public class OffHeapCompactLRU implements AutoCloseable {
     }
 
     public void moveToHead(int slot, int segType) {
-        // Simple optimization: if already head, do nothing
         if (segType == WINDOW && headWindow == slot)
             return;
         if (segType == PROBATION && headProbation == slot)
@@ -213,7 +218,6 @@ public class OffHeapCompactLRU implements AutoCloseable {
         if (segType == PROTECTED && headProtected == slot)
             return;
 
-        // Otherwise unlink and add to head
         if (segType == WINDOW) {
             removeWindow(slot);
             addToWindow(slot);

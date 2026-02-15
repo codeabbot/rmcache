@@ -1,108 +1,128 @@
 # RMCache
 
-**High-Performance, Billion-Scale Off-Heap Cache for Java 25+**
+High-Performance, Billion-Scale Off-Heap Cache for Java 25+
 
-RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the **Java 25 Foreign Function & Memory (FFM) API**, it stores data entirely off-heap, eliminating Garbage Collection (GC) pauses even when managing billions of entries. It significantly outperforms standard on-heap solutions (like `ConcurrentHashMap`) and matches or beats specialized native alternatives in both throughput and latency.
-
----
-
-## 🚀 Key Features
-
-*   **Zero-GC Overhead**: All keys, values, and internal data structures are stored off-heap.
-*   **Java 25 FFM API**: Built on the modern authorized memory access API, replacing unsafe `sun.misc.Unsafe`.
-*   **Performance Optimized**:
-    *   **64-bit Slot Packing**: Consolidates hash and pointer into a single 64-bit memory operation for atomic-like visibility and reduced memory bandwidth.
-    *   **Cache-Line Friendly**: Linear probing utilizing CPU cache lines effectively.
-    *   **SIMD-Ready**: Designed with alignment for potential Vector API optimizations.
-*   **Massive Scalability**: Tested to scale linearly to **1 Billion+ entries** with a tiny fixed heap footprint (~50MB).
-*   **Optional L1 Hot Cache**: Choose heap or **off-heap** L1 for hot-key acceleration.
+RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java 25 Foreign Function & Memory (FFM) API, it stores data off-heap and avoids GC pauses even when managing very large data sets.
 
 ---
 
-## 🏗 Architecture & Design Principles
+## Key Features
 
-RMCache avoids the "object overhead" of Java by treating memory as a raw slab, similar to C++.
-
-### 1. The GhostCache Pattern
-RMCache uses a "Ghost" architecture where the Java heap only holds lightweight handles. The heavy lifting—the actual hash table and data—resides in native memory.
-*   **Heap**: Small controller objects (`OffHeapCache`, `SlabAllocator`).
-*   **Off-Heap**: The massive hash table array and all entry data blocks.
-
-### 2. OffHeapHashTable (The Core)
-A custom open-addressing hash table optimized for modern CPUs.
-*   **64-bit Slot Optimization**: Each slot is exactly 8 bytes.
-    *   **High 32 bits**: Pointer to the data (Slot ID).
-    *   **Low 32 bits**: 32-bit Hash of the key.
-    *   *Benefit*: A single 64-bit read loads both the check-hash and the data pointer. A single 64-bit write updates them atomically.
-*   **Linear Probing**: accessing contiguous memory maximizes L1/L2 cache hits.
-
-### 3. Slab Allocation
-To prevent fragmentation and `malloc` overhead:
-*   **SlabAllocator**: Requests large chunks (e.g., 2MB) from the OS.
-*   **EntryPool**: Sub-allocates variable-sized entries (Key + Value + Metadata) from these slabs.
-*   **Zero Copy**: Data is copied directly from efficient ByteBuffers/MemorySegments.
+- Zero-heap data path: keys, values, and index structures live off-heap.
+- Java 25 FFM API: no Unsafe dependency.
+- 64-bit slot packing: one 64-bit read for hash + slot.
+- Key-match fast path + fingerprint check to reduce unnecessary comparisons.
+- Zero-copy reads and large-value streaming support.
+- GhostCache L1: HEAP, OFF_HEAP, DISABLED, or AUTO selection.
+- Memory estimator and index memory budgeting for predictable capacity planning.
+- Background eviction to keep hot path latency low.
 
 ---
 
-## 📊 Performance Benchmarks
+## Architecture
 
-Benchmarks verified on **macOS / Java 25 (OpenJDK)**.
-
-### Latency (ns/op) - Lower is Better
-*RMCache isolates the application from GC pauses, maintaining stable latency.*
-
-| Operation | Scale (Entries) | RMCache | Reference (NMA/Map) | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **GET** (Read) | 10,000 | **~123 ns** | ~225 ns | ✅ **1.8x Faster** |
-| **GET** (Read) | 100,000 | **~369 ns** | ~376 ns | ✅ Faster |
-| **GET** (Read) | 1,000,000 | **~555 ns** | ~597 ns | ✅ Faster |
-| **PUT** (Write) | 10,000 | **~178 ns** | ~181 ns | ✅ **Faster** |
-| **PUT** (Write) | 100,000 | ~389 ns | ~320 ns | Competitive |
-| **PUT** (Write) | 1,000,000 | ~540 ns | ~498 ns | Competitive |
-
-### Throughput (ops/s) - Higher is Better
-*   **Small Scale (10k)**: Sustains **~33 Million+** writes/sec and **~38 Million+** reads/sec.
-*   **Large Scale (1M)**: Sustains **~7-9 Million** ops/sec depending on workload.
-
----
-
-## 💾 Memory Usage
-
-RMCache's primary advantage is its memory model. It decouples cache size from Java Heap size.
-
-### Heap vs. Off-Heap Comparison (Projected for 1 Billion Entries)
-
-| Metric | RMCache | Standard JVM Map |
-| :--- | :--- | :--- |
-| **On-Heap Footprint** | **~50 MB** (Fixed) | **~80 GB+** (GC Hell) |
-| **Off-Heap Usage** | ~74 GB | ~0 GB |
-| **GC Impact** | **None** | Massive Full GC Pauses |
-
-### Memory Calculation Formula
-To estimate the off-heap memory required:
-
-```text
-Total Memory = (Internal Overhead) + (Data Storage)
-
-1. Index Overhead:
-   Capacity = NextPowerOf2(TargetEntries / LoadFactor)
-   IndexMemory = Capacity * 8 bytes
-
-2. Data Storage:
-   EntrySize = 12 bytes (Header) + KeyLength + ValueLength + Padding
-   DataMemory = TargetEntries * EntrySize
+```mermaid
+flowchart LR
+  A["Client API"] --> B["CacheBuilder"]
+  B --> C["OffHeapCacheImpl"]
+  C --> D["OffHeapHashTable"]
+  C --> E["EntryPool"]
+  E --> F["SlabAllocator"]
+  F --> G["BuddyAllocator for large blocks"]
+  C --> H["GhostCache (heap)"]
+  C --> I["OffHeapGhostCache"]
+  D --> J["Native Memory"]
+  E --> J
+  F --> J
+  G --> J
 ```
 
-*Example*: 1M entries, 16-byte keys, 64-byte values.
-*   Index: ~1.4M slots * 8 bytes ≈ 11MB
-*   Data: 1M * (12 + 16 + 64) ≈ 92MB
-*   **Total**: ~103 MB Off-Heap.
+---
+
+## Performance Benchmarks
+
+Benchmarks verified on macOS / Java 25 (OpenJDK). Latest results (Feb 2026) include all optimization phases: compact entry header (20B), vectorized key comparison, O(1) size class lookup, packed allocation handles, packed offsets (O8), striped LRU locks, and off-heap buddy allocator.
+
+### Latency (ns/op) - FairComparisonScaleBenchmark - Lower is Better
+
+| Operation | Scale (Entries) | RMCache | RMCache + GhostCache | Reference (NMA) | Status vs NMA |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **GET** | 10,000 | **136 ns** | 155 ns | 209 ns | ✅ **35% faster** |
+| **GET** | 100,000 | **314 ns** | 348 ns | 374 ns | ✅ **16% faster** |
+| **GET** | 1,000,000 | **507 ns** | 534 ns | 592 ns | ✅ **14% faster** |
+| **PUT** | 10,000 | **222 ns** | 210 ns | 192 ns | ⚠️ 16% slower |
+| **PUT** | 100,000 | **395 ns** | 390 ns | 328 ns | ⚠️ 20% slower |
+| **PUT** | 1,000,000 | **504 ns** | 522 ns | 542 ns | ✅ **7% faster** |
+
+**Key Observations** (Feb 2026, post O8 optimization):
+- GET latency leads NMA by **14-35%** across all scales.
+- PUT performance dramatically improved with O8 packed offsets — now **beats NMA at 1M** (504ns vs 542ns).
+- With OFF_HEAP GhostCache enabled, PUT further improves at small scale (210ns vs 222ns).
+- Compared to EhCache: **4-6× faster GET**, **3-6× faster PUT** across all operations.
 
 ---
 
-## 💻 Usage
+## Optimizations for 1B Scale
+
+RMCache includes 9 optimizations designed to minimize memory overhead, reduce hot-path latency, and improve concurrency at billion-entry scale.
+
+| Category | Optimization | Impact |
+| :--- | :--- | :--- |
+| **Memory** | Compact Entry Header (24B → 20B) | –4 GB @ 1B entries |
+| **Memory** | Compact LRU Metadata (9B → 8B) | –1 GB @ 1B entries |
+| **Memory** | Capped FrequencySketch Table (16M max) | –7.9 GB @ 1B entries |
+| **Latency** | Vectorized Key Comparison (8B/compare) | 20-40% faster GET |
+| **Latency** | O(1) Size Class Lookup | Faster allocation |
+| **Latency** | Packed AllocationHandle (zero object GC) | No GC on hot path |
+| **Concurrency** | Striped LRU Lock (up to 64 shards) | N× less lock contention |
+| **Concurrency** | Larger Async Access Buffers (4096) | Better eviction accuracy |
+| **GC** | Off-Heap Buddy Allocator | Eliminated heap data structures |
+
+Projected memory at 1B entries: **~326 GB** (down from ~339 GB baseline).
+
+---
+
+## Memory Estimator
+
+RMCache exposes a memory estimator to size off-heap allocations accurately.
+
+**Entry size formula** (approx):
+
+```
+EntrySize = HEADER(20) + 4 + pad(keyLen) + 4 + valueLen
+```
+
+**Index size formula** (approx):
+
+```
+IndexBytes = HashTable(8 * slots) + Offsets(8 * slots) + FreeList(4 * slots)
+```
+
+**Total bytes** (approx):
+
+```
+Total = DataBytes + IndexBytes + AllocatorOverhead(~10% default)
+```
+
+### Example
+
+```java
+MemoryEstimator.MemoryEstimate estimate = new CacheBuilder<String, byte[]>()
+        .maxEntries(1_000_000)
+        .averageKeySize(16)
+        .averageValueSize(256)
+        .estimateMemory();
+
+System.out.println("Total bytes: " + estimate.totalBytes());
+System.out.println("Bytes/entry: " + estimate.bytesPerEntry());
+```
+
+---
+
+## Usage
 
 ### Dependency
+
 Requires Java 25+ with `--enable-native-access=ALL-UNNAMED`.
 
 ```gradle
@@ -115,74 +135,146 @@ dependencies {
 
 ```java
 import com.codeabbot.rmcache.CacheBuilder;
+import com.codeabbot.rmcache.GhostCacheMode;
 import com.codeabbot.rmcache.OffHeapCache;
+import com.codeabbot.rmcache.Units;
 
-public class Example {
-    public static void main(String[] args) {
-        // 1. Configure and Build
-        try (OffHeapCache cache = new CacheBuilder()
-                .initialCapacity(1_000_000)      // Estimated entry count
-                .offHeapMemoryBytes(1024 * 1024 * 512) // 512 MB Pool
-                .concurrencyLevel(16)            // Number of stripes
-                .build()) {
+try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
+        .maxEntries(1_000_000)
+        .averageKeySize(16)
+        .averageValueSize(256)
+        .offHeapMemory(Units.gigabytes(4))
+        .ghostCacheMode(GhostCacheMode.AUTO)
+        .build()) {
 
-            // 2. Put Data
-            String key = "user:123";
-            String value = "{\"name\": \"Alice\", \"role\": \"admin\"}";
-            cache.put(key, value);
+    cache.put("user:123", new byte[256]);
+    byte[] value = cache.get("user:123");
+}
+```
 
-            // 3. Get Data
-            String result = cache.get(key);
-            System.out.println("Cached: " + result);
-            
-            // 4. Custom key/value types (requires Serializer)
-            // cache.put(100L, myObject);
-        } // Auto-closes and frees native memory
-    }
+### Zero-Heap Profile
+
+```java
+try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
+        .zeroHeapProfile() // off-heap ghost cache + background eviction
+        .ghostCacheMode(GhostCacheMode.AUTO)
+        .maxEntries(5_000_000)
+        .offHeapMemory(Units.gigabytes(16))
+        .build()) {
+
+    // zero-heap hot-path
 }
 ```
 
 ---
 
-## ⚙️ Configuration
+## Serializer Helper
+
+For custom value types, use `SerializerHelper` to build a `SegmentValueSerializer` without boilerplate.
+
+```java
+SegmentValueSerializer<MyType> serializer = SerializerHelper.segment(
+        MyType::estimatedSize,
+        (value, segment, offset, maxLen) -> value.writeTo(segment, offset, maxLen),
+        (bytes, off, len) -> MyType.from(bytes, off, len));
+
+try (OffHeapCache<String, MyType> cache = new CacheBuilder<String, MyType>()
+        .valueSerializer(serializer)
+        .build()) {
+    cache.put("k", new MyType());
+}
+```
+
+---
+
+## Configuration
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `initialCapacity` | 100,000 | Initial number of entries to size the hash table. |
-| `offHeapMemoryBytes`| 128 MB | Total size of the native memory slab for data. |
-| `concurrencyLevel` | 16 | Number of internal lock stripes (adjust for high thread counts). |
-| `enablePrefetch` | true | Enables CPU prefetch instructions for hash table probing. |
-| `ghostCacheMode` | HEAP | `HEAP`, `OFF_HEAP`, or `DISABLED` (off-heap mode keeps zero-heap semantics). |
-| `ghostCacheSize` | auto | L1 cache capacity for hot keys. |
-| `stringKeyEncoding` | UTF8 | `UTF8` (default) or `LATIN1` for faster ASCII/Latin1 keys. |
-| `backgroundEviction` | false | Enables background eviction to keep hot path low-latency. |
-| `backgroundEvictionInterval` | 10ms | How often the background eviction thread runs. |
-| `evictionMemoryWatermarks` | 0.95 / 0.90 | High/low memory watermarks for background eviction. |
-| `evictionPolicy` | LRU | *Planned feature*. Currently blocks/rejects on full. |
+| `maxEntries` | 1,000,000 | Target entry count (capacity planning). |
+| `averageKeySize` | 32 | Used for memory estimation. |
+| `averageValueSize` | 256 | Used for memory estimation. |
+| `offHeapMemory` | auto | Total off-heap pool size. |
+| `hashTableStripes` | auto | Stripe count (power of 2). Auto: 256 (\u003c100k), 1024 (100k-1M), 4096 (1M-10M), 16384 (10M+). |
+| `entryPoolPartitions` | auto | Entry pool partitions (power of 2). |
+| `hashTableLoadFactor` | 0.60 | Lower = faster probes, higher = lower index memory. |
+| `hashTableInitialCapacity` | auto | Per-stripe hash table capacity. |
+| `indexMemoryBudgetBytes` | unset | Budget index memory and auto-adjust load factor. |
+| `indexMemoryBudgetPercent` | unset | Budget index memory as % of off-heap pool. |
+| `ghostCacheMode` | AUTO | AUTO, HEAP, OFF_HEAP, DISABLED. |
+| `ghostCacheSize` | auto | L1 cache capacity. |
+| `stringKeyEncoding` | UTF8 | UTF8 or LATIN1 (faster for ASCII). |
+| `backgroundEviction` | true | Enable background eviction. |
+| `backgroundEvictionInterval` | 10ms | Eviction poll interval. |
+| `evictionMemoryWatermarks` | 0.95 / 0.90 | High/low thresholds. |
+| `prefetch` | false | Hash-table prefetching. |
+| `slabSize` | 64KB | Slab allocator chunk size. |
 
 ---
 
-## 🛠 Technical Details
+## Index Memory Budgeting
 
-### 64-bit Slot Packing (The Secret Sauce)
-Instead of struct-like objects, the hash table is a raw `long[]` array in native memory.
+If you want predictable index memory usage, you can set a budget and let the builder derive the hash table size and load factor.
 
 ```java
-// Logic for combining Hash and SlotID
-long entry = (keyHash & 0xFFFFFFFFL) | ((long) slotId << 32);
-table.setAtIndex(ValueLayout.JAVA_LONG, pos, entry);
+new CacheBuilder<String, byte[]>()
+    .maxEntries(1_000_000)
+    .offHeapMemory(Units.gigabytes(8))
+    .indexMemoryBudgetPercent(0.15) // 15% of off-heap pool
+    .build();
 ```
-This enables extremely efficient "check-and-fetch" operations in the hot path, effectively halving the memory latency for lookups.
-
-### Large Values ( > 256 KB )
-For large values, prefer a `SegmentValueSerializer` so data is written directly into off-heap memory without intermediate heap buffers. The built-in byte[] serializer already supports this. Implementations should ensure `estimateSize()` is an upper bound.
-
-### String Key Encoding
-The default key encoding is UTF-8. For ASCII/Latin1-only keys, you can enable a faster Latin1 path via `stringKeyEncoding(LATIN1)`.
-
-### Native Interop Safety
-RMCache uses `Arena` (from Java FFM) to manage lifecycles. When the cache is closed, the Arena is closed, ensuring deterministic deallocation and preventing native memory leaks.
 
 ---
 
-**© 2026 CodeAbbot Team**
+## Memory Comparison (RMCache vs NMA)
+
+Use the built-in suite:
+
+```
+./gradlew runMemoryScalability
+```
+
+This prints 10k/100k/1M measurements and 1B extrapolations (RMCache uses the new estimator; NMA uses page-size estimation). Results depend on key/value sizes and page size.
+
+Latest run (macOS, Java 25, 16B keys / 256B values, 4GB off-heap, NMA page size 4096):
+
+| Scale | Provider | Heap (MB) | Off-Heap (MB) | Bytes/Entry |
+| :--- | :--- | :--- | :--- | :--- |
+| 10k | RMCache | 1.50 | 4.88 | 669.8 |
+| 10k | NMA | 14.56 | 39.06 | 5623.2 |
+| 100k | RMCache | 0.85 | 48.83 | 520.9 |
+| 100k | NMA | 32.26 | 390.63 | 4434.3 |
+| 1M | RMCache | 1.28 | 488.28 | 513.3 |
+| 1M | NMA | 209.86 | 3906.25 | 4316.1 |
+
+1B extrapolation:
+
+| Provider | Heap Usage | Off-Heap Usage | Total RAM |
+| :--- | :--- | :--- | :--- |
+| RMCache | < 50 MB | 339.4 GB | 339.4 GB |
+| NMA | High (CHM) | 3814.7 GB | 3814.7 GB |
+
+---
+
+## Large Values
+
+Large values (4KB, 8KB, 128KB, 512KB and above) are supported. Values larger than slab size are served by the buddy allocator. For large values, always prefer a `SegmentValueSerializer` to avoid heap buffers.
+
+---
+
+## Notes on Load Factor
+
+Lower load factor:
+- Fewer probes
+- Lower tail latency
+- Higher index memory usage
+
+Higher load factor:
+- Lower index memory usage
+- Longer probes and higher latency at scale
+
+---
+
+## License
+
+Apache License 2.0

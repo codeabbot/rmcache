@@ -5,6 +5,14 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * A lightweight handle to an allocated memory block.
+ * Supports a packed long representation to avoid object allocation on the hot
+ * path.
+ *
+ * Packed format (64 bits): [offset:40 | capacity:20 | sizeClass:4]
+ * - offset: 40 bits → up to 1 TB addressable
+ * - capacity: 20 bits → up to 1 MB block size (actual capacity = raw << 6, so
+ * up to 64 MB)
+ * - sizeClass: 4 bits → 0-10 for slab classes, 15 for large (-1 mapped to 0xF)
  *
  * @author Rabindra Meher
  */
@@ -14,11 +22,41 @@ public class AllocationHandle {
     private int capacity;
     private final int sizeClass;
 
+    // Packed handle constants
+    private static final int SC_BITS = 4;
+    private static final int CAP_BITS = 20;
+    private static final long SC_MASK = (1L << SC_BITS) - 1; // 0xF
+    private static final long CAP_MASK = (1L << CAP_BITS) - 1; // 0xFFFFF
+    private static final int CAP_SHIFT = 6; // capacity granularity = 64 bytes
+
     public AllocationHandle(MemorySegment segment, long offset, int capacity, int sizeClass) {
         this.segment = segment;
         this.offset = offset;
         this.capacity = capacity;
         this.sizeClass = sizeClass;
+    }
+
+    /**
+     * Pack offset, capacity, and sizeClass into a single long.
+     * Avoids object allocation on the hot path.
+     */
+    public static long pack(long offset, int capacity, int sizeClass) {
+        int sc4 = (sizeClass < 0) ? 0xF : (sizeClass & 0xF);
+        long capEncoded = ((long) capacity >>> CAP_SHIFT) & CAP_MASK;
+        return (offset << (SC_BITS + CAP_BITS)) | (capEncoded << SC_BITS) | sc4;
+    }
+
+    public static long unpackOffset(long packed) {
+        return packed >>> (SC_BITS + CAP_BITS);
+    }
+
+    public static int unpackCapacity(long packed) {
+        return (int) ((packed >>> SC_BITS) & CAP_MASK) << CAP_SHIFT;
+    }
+
+    public static int unpackSizeClass(long packed) {
+        int sc4 = (int) (packed & SC_MASK);
+        return (sc4 == 0xF) ? -1 : sc4;
     }
 
     public MemorySegment getSegment() {

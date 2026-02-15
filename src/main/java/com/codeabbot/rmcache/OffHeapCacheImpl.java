@@ -9,7 +9,6 @@ import com.codeabbot.rmcache.index.EntryPool;
 import com.codeabbot.rmcache.index.GhostCache;
 import com.codeabbot.rmcache.index.OffHeapGhostCache;
 import com.codeabbot.rmcache.index.OffHeapHashTable;
-import com.codeabbot.rmcache.index.ValueWriter;
 import com.codeabbot.rmcache.memory.NativeMemory;
 import com.codeabbot.rmcache.memory.SlabAllocator;
 import com.codeabbot.rmcache.serializer.KeySerializer;
@@ -20,17 +19,11 @@ import com.codeabbot.rmcache.serializer.BuiltInSerializers.ByteArrayValueSeriali
 import com.codeabbot.rmcache.serializer.ValueSerializer;
 import com.codeabbot.rmcache.util.CoarseClock;
 import com.codeabbot.rmcache.util.ThreadLocalKeyBuffer;
-import io.micrometer.core.instrument.FunctionCounter;
-import io.micrometer.core.instrument.Gauge;
-import io.micrometer.core.instrument.MeterRegistry;
-import io.micrometer.core.instrument.Tag;
-import io.micrometer.core.instrument.binder.BaseUnits;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Collections;
-import java.util.List;
 import java.util.Set;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
@@ -57,10 +50,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
      */
     static class CacheContext {
         byte[] valueBuffer = new byte[256 * 1024];
-        // Sub-100ns optimization: thread-local stats
-        long hits = 0;
-        long misses = 0;
-        int opCounter = 0; // Mask check trigger
     }
 
     private final KeySerializer<K> keySerializer;
@@ -73,12 +62,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final EvictionFilter<K> evictionFilter;
     private final GhostCache<K, V> ghostCache;
     private final OffHeapGhostCache offHeapGhostCache;
-    private final MeterRegistry meterRegistry;
-    private final String cacheName;
 
     private final LongAdder globalHits = new LongAdder();
     private final LongAdder globalMisses = new LongAdder();
     private final LongAdder globalEvictions = new LongAdder();
+
     private volatile boolean closed = false;
 
     private final ThreadLocal<CacheContext> context = ThreadLocal.withInitial(CacheContext::new);
@@ -92,6 +80,14 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final boolean isStringKey;
     private final boolean isLatin1Key;
     private final boolean isByteArrayValue;
+    private final boolean useKeyMatchFastPath;
+
+    // O5: Pre-computed serializer type casts (avoids per-call instanceof)
+    private final SegmentValueSerializer<V> cachedSegSer;
+    private final StreamingSerializer<V> cachedStreamSer;
+    // O1: Pre-computed ghost cache presence flags
+    private final boolean hasGhostCache;
+    private final boolean hasOffHeapGhostCache;
 
     private final boolean backgroundEviction;
     private final long backgroundEvictionIntervalMs;
@@ -112,8 +108,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             EvictionFilter<K> evictionFilter,
             GhostCache<K, V> ghostCache,
             OffHeapGhostCache offHeapGhostCache,
-            MeterRegistry meterRegistry,
-            String cacheName,
             boolean backgroundEviction,
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
@@ -131,47 +125,27 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.evictionFilter = evictionFilter;
         this.ghostCache = ghostCache;
         this.offHeapGhostCache = offHeapGhostCache;
-        this.meterRegistry = meterRegistry;
-        this.cacheName = cacheName;
 
         this.isStringKey = keySerializer instanceof StringKeySerializer;
         this.isLatin1Key = (keySerializer instanceof StringKeySerializer s) && s.isLatin1FastPath();
         this.isByteArrayValue = valueSerializer instanceof ByteArrayValueSerializer;
+        this.useKeyMatchFastPath = keySerializer instanceof com.codeabbot.rmcache.serializer.FastKeySerializer;
+
+        // O5: Cache serializer type casts
+        this.cachedSegSer = (valueSerializer instanceof SegmentValueSerializer)
+                ? (SegmentValueSerializer<V>) valueSerializer
+                : null;
+        this.cachedStreamSer = (cachedSegSer == null && valueSerializer instanceof StreamingSerializer)
+                ? (StreamingSerializer<V>) valueSerializer
+                : null;
+        // O1: Cache ghost cache presence
+        this.hasGhostCache = ghostCache != null;
+        this.hasOffHeapGhostCache = offHeapGhostCache != null;
 
         this.backgroundEviction = backgroundEviction;
         this.backgroundEvictionIntervalMs = Math.max(1, backgroundEvictionIntervalMs);
         this.evictionHighWatermark = evictionHighWatermark;
         this.evictionLowWatermark = evictionLowWatermark;
-
-        if (meterRegistry != null) {
-            List<Tag> tags = List.of(Tag.of("cache", cacheName));
-
-            FunctionCounter.builder("rmcache.hits", globalHits, LongAdder::sum)
-                    .tags(tags)
-                    .description("Number of cache hits")
-                    .register(meterRegistry);
-
-            FunctionCounter.builder("rmcache.misses", globalMisses, LongAdder::sum)
-                    .tags(tags)
-                    .description("Number of cache misses")
-                    .register(meterRegistry);
-
-            FunctionCounter.builder("rmcache.evictions", globalEvictions, LongAdder::sum)
-                    .tags(tags)
-                    .description("Number of cache evictions")
-                    .register(meterRegistry);
-
-            Gauge.builder("rmcache.size", hashTable, h -> (double) h.size())
-                    .tags(tags)
-                    .description("Current number of entries")
-                    .register(meterRegistry);
-
-            Gauge.builder("rmcache.memory.used", allocator, a -> (double) a.getUsedBytes())
-                    .tags(tags)
-                    .baseUnit(BaseUnits.BYTES)
-                    .description("Off-heap memory used")
-                    .register(meterRegistry);
-        }
 
         maintenanceExecutor.scheduleWithFixedDelay(() -> {
             try {
@@ -194,17 +168,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init done");
-        }
-    }
-
-    private void flushStats(CacheContext ctx) {
-        if (ctx.hits > 0) {
-            globalHits.add(ctx.hits);
-            ctx.hits = 0;
-        }
-        if (ctx.misses > 0) {
-            globalMisses.add(ctx.misses);
-            ctx.misses = 0;
         }
     }
 
@@ -281,7 +244,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (closed)
             throw new IllegalStateException("Closed");
 
-        CacheContext ctx = context.get();
+        putInternal(key, value, ttl, priority);
+    }
+
+    private void putInternal(K key, V value, Duration ttl, short priority) {
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
 
         byte[] keyBytes;
@@ -295,21 +261,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             keyLen = keyBytes.length;
         }
 
-        SegmentValueSerializer<V> segSer =
-                (valueSerializer instanceof SegmentValueSerializer) ? (SegmentValueSerializer<V>) valueSerializer
-                        : null;
-        StreamingSerializer<V> streamSer =
-                (segSer == null && valueSerializer instanceof StreamingSerializer)
-                        ? (StreamingSerializer<V>) valueSerializer
-                        : null;
-        ValueWriter writer = null;
+        // O5: Use cached serializer types instead of per-call instanceof
+        SegmentValueSerializer<V> segSer = this.cachedSegSer;
+        StreamingSerializer<V> streamSer = this.cachedStreamSer;
         int valueMaxLen = 0;
         byte[] valueBytes = null;
         int valueLen = 0;
 
+        CacheContext ctx = context.get();
         if (segSer != null) {
             valueMaxLen = Math.max(0, segSer.estimateSize(value));
-            writer = (segment, offset, maxLen) -> segSer.serializeTo(value, segment, offset, maxLen);
         } else if (streamSer != null) {
             int estimate = Math.max(0, streamSer.estimateSize(value));
             byte[] buf = ctx.valueBuffer;
@@ -329,8 +290,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         long expiresAtMillis = (ttl != null) ? CoarseClock.getNow() + ttl.toMillis() : 0L;
 
+        // O1: Use cached boolean instead of null check
         int existingSlot = 0;
-        if (offHeapGhostCache != null) {
+        if (hasOffHeapGhostCache) {
             existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
         }
         if (existingSlot == 0) {
@@ -338,30 +300,27 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (existingSlot != 0) {
-            boolean updated = (writer != null)
-                    ? entryPool.updateValueWithWriter(existingSlot, valueMaxLen, writer)
+            boolean updated = (segSer != null)
+                    ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value)
                     : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen);
 
             if (updated) {
                 evictionPolicy.onAccess(existingSlot, keyHash);
-                if (ghostCache != null)
-                    ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
-                if (offHeapGhostCache != null)
-                    offHeapGhostCache.put(keyHash, existingSlot);
+                // O6: Skip ghost cache bookkeeping on updates — slot already tracked
                 return;
             }
 
-            int newSlot = (writer != null)
-                    ? entryPool.allocateWithWriter(keyHash, keyBytes, keyLen, valueMaxLen, writer, priority,
+            int newSlot = (segSer != null)
+                    ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value, priority,
                             expiresAtMillis)
                     : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                             expiresAtMillis);
             if (newSlot == 0) {
                 requestEviction(true);
                 evictIfNeeded(true);
-                newSlot = (writer != null)
-                        ? entryPool.allocateWithWriter(keyHash, keyBytes, keyLen, valueMaxLen, writer, priority,
-                                expiresAtMillis)
+                newSlot = (segSer != null)
+                        ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value,
+                                priority, expiresAtMillis)
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (newSlot == 0)
@@ -379,9 +338,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 evictionPolicy.onAdd(newSlot, keyHash, priority);
             }
 
-            if (ghostCache != null)
+            if (hasGhostCache)
                 ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
-            if (offHeapGhostCache != null)
+            if (hasOffHeapGhostCache)
                 offHeapGhostCache.put(keyHash, newSlot);
             return;
         }
@@ -394,16 +353,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
         }
 
-        int slot = (writer != null)
-                ? entryPool.allocateWithWriter(keyHash, keyBytes, keyLen, valueMaxLen, writer, priority,
+        int slot = (segSer != null)
+                ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value, priority,
                         expiresAtMillis)
                 : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                         expiresAtMillis);
         if (slot == 0) {
             requestEviction(true);
             evictIfNeeded(true);
-            slot = (writer != null)
-                    ? entryPool.allocateWithWriter(keyHash, keyBytes, keyLen, valueMaxLen, writer, priority,
+            slot = (segSer != null)
+                    ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value, priority,
                             expiresAtMillis)
                     : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                             expiresAtMillis);
@@ -416,9 +375,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             if (oldSlot == -1) {
                 entryPool.free(slot);
                 evictIfNeeded(true);
-                int retrySlot = (writer != null)
-                        ? entryPool.allocateWithWriter(keyHash, keyBytes, keyLen, valueMaxLen, writer, priority,
-                                expiresAtMillis)
+                int retrySlot = (segSer != null)
+                        ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value,
+                                priority, expiresAtMillis)
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (retrySlot == 0) {
@@ -431,22 +390,22 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 } else if (retryOld != 0) {
                     entryPool.free(retrySlot);
                     evictionPolicy.onAccess(retryOld, keyHash);
-                    if (offHeapGhostCache != null)
+                    if (hasOffHeapGhostCache)
                         offHeapGhostCache.put(keyHash, retryOld);
                 } else {
                     evictionPolicy.onAdd(retrySlot, keyHash, priority);
-                    if (offHeapGhostCache != null)
+                    if (hasOffHeapGhostCache)
                         offHeapGhostCache.put(keyHash, retrySlot);
                 }
                 return;
             } else if (oldSlot != 0) {
                 entryPool.free(slot); // Race: someone else added it
                 evictionPolicy.onAccess(oldSlot, keyHash);
-                if (offHeapGhostCache != null)
+                if (hasOffHeapGhostCache)
                     offHeapGhostCache.put(keyHash, oldSlot);
             } else {
                 evictionPolicy.onAdd(slot, keyHash, priority);
-                if (offHeapGhostCache != null)
+                if (hasOffHeapGhostCache)
                     offHeapGhostCache.put(keyHash, slot);
             }
         } catch (Throwable e) {
@@ -454,7 +413,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             throw e;
         }
 
-        if (ghostCache != null)
+        if (hasGhostCache)
             ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
     }
 
@@ -464,41 +423,39 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return null;
 
         CacheContext ctx = context.get();
-
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
 
-        if (ghostCache != null) {
+        if (hasGhostCache) {
             V ghostHit = ghostCache.get(key, keyHash);
             if (ghostHit != null) {
-                ctx.hits++;
-                if (((++ctx.opCounter) & 0x7F) == 0)
-                    flushStats(ctx);
+                globalHits.increment();
                 return ghostHit;
             }
         }
 
         int slot = 0;
-        if (offHeapGhostCache != null) {
+        if (hasOffHeapGhostCache) {
             slot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
         }
 
         byte[] keyBytes = null;
         int keyLen = 0;
         if (slot == 0) {
-            if (isLatin1Key && key instanceof String s) {
-                ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                keyBytes = res.buffer();
-                keyLen = res.length();
+            if (useKeyMatchFastPath) {
+                slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                keyBytes = keySerializer.serialize(key);
-                keyLen = keyBytes.length;
+                if (isLatin1Key && key instanceof String s) {
+                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                    keyBytes = res.buffer();
+                    keyLen = res.length();
+                } else {
+                    keyBytes = keySerializer.serialize(key);
+                    keyLen = keyBytes.length;
+                }
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
-
-            slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             if (slot == 0) {
-                ctx.misses++;
-                if (((++ctx.opCounter) & 0x7F) == 0)
-                    flushStats(ctx);
+                globalMisses.increment();
                 return null;
             }
         }
@@ -511,22 +468,18 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             if (keyBytes != null) {
                 removeInternal(keyHash, keyBytes, keyLen, slot, EvictionCause.EXPIRED);
             }
-            ctx.misses++;
-            if (((++ctx.opCounter) & 0x7F) == 0)
-                flushStats(ctx);
+            globalMisses.increment();
             return null;
         }
 
-        ctx.hits++;
-        if (((++ctx.opCounter) & 0x7F) == 0)
-            flushStats(ctx);
+        globalHits.increment();
         evictionPolicy.onAccess(slot, keyHash);
 
         V result = readValueFromSlot(slot, ctx);
 
-        if (ghostCache != null)
+        if (hasGhostCache)
             ghostCache.put(key, keyHash, result);
-        if (offHeapGhostCache != null)
+        if (hasOffHeapGhostCache)
             offHeapGhostCache.put(keyHash, slot);
 
         return result;
@@ -546,8 +499,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return res;
         }
 
-        if (valueSerializer instanceof StreamingSerializer) {
-            StreamingSerializer<V> sSer = (StreamingSerializer<V>) valueSerializer;
+        if (cachedStreamSer != null) {
             int valLen = entryPool.getValueLen(slot);
             byte[] vBuf = ctx.valueBuffer;
             if (valLen > vBuf.length) {
@@ -555,7 +507,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 ctx.valueBuffer = vBuf;
             }
             entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
-            return sSer.deserializeFrom(vBuf, 0, valLen);
+            return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
 
         byte[] valBytes = entryPool.readValue(slot);
@@ -583,6 +535,135 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return true;
     }
 
+    @Override
+    public boolean putIfAbsent(K key, V value) {
+        return putIfAbsent(key, value, null);
+    }
+
+    @Override
+    public boolean putIfAbsent(K key, V value, Duration ttl) {
+        checkNotClosed();
+        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        byte[] keyBytes;
+        int keyLen;
+        if (isLatin1Key && key instanceof String s) {
+            ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+            keyBytes = res.buffer();
+            keyLen = res.length();
+        } else {
+            keyBytes = keySerializer.serialize(key);
+            keyLen = keyBytes.length;
+        }
+
+        // Check if key already exists
+        int existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+        if (existingSlot != 0) {
+            // Key exists, don't overwrite
+            return false;
+        }
+
+        // Key doesn't exist, perform put
+        put(key, value, ttl, (short) 0);
+        return true;
+    }
+
+    @Override
+    public V computeIfAbsent(K key, java.util.function.Function<K, V> loader) {
+        return computeIfAbsent(key, loader, null);
+    }
+
+    @Override
+    public V computeIfAbsent(K key, java.util.function.Function<K, V> loader, Duration ttl) {
+        checkNotClosed();
+
+        // First attempt to get existing value
+        V existing = get(key);
+        if (existing != null) {
+            return existing;
+        }
+
+        // Compute the value
+        V computed = loader.apply(key);
+        if (computed == null) {
+            return null;
+        }
+
+        // Try to insert (race condition possible, but acceptable)
+        put(key, computed, ttl, (short) 0);
+        return computed;
+    }
+
+    @Override
+    public void putAll(java.util.Map<K, V> entries) {
+        putAll(entries, null);
+    }
+
+    @Override
+    public void putAll(java.util.Map<K, V> entries, Duration ttl) {
+        checkNotClosed();
+        for (java.util.Map.Entry<K, V> entry : entries.entrySet()) {
+            put(entry.getKey(), entry.getValue(), ttl, (short) 0);
+        }
+    }
+
+    @Override
+    public java.util.Map<K, V> getAll(java.util.Collection<K> keys) {
+        checkNotClosed();
+        java.util.Map<K, V> result = new java.util.HashMap<>(keys.size());
+        for (K key : keys) {
+            V value = get(key);
+            if (value != null) {
+                result.put(key, value);
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public CompletableFuture<Void> putAsync(K key, V value) {
+        return CompletableFuture.runAsync(() -> put(key, value));
+    }
+
+    @Override
+    public CompletableFuture<V> getAsync(K key) {
+        return CompletableFuture.supplyAsync(() -> get(key));
+    }
+
+    @Override
+    public boolean contains(K key) {
+        return get(key) != null;
+    }
+
+    @Override
+    public int size() {
+        return (int) hashTable.size();
+    }
+
+    @Override
+    public Set<K> getKeys() {
+        return Collections.emptySet();
+    }
+
+    @Override
+    public void clear() {
+        if (ghostCache != null)
+            ghostCache.invalidateAll();
+        if (offHeapGhostCache != null)
+            offHeapGhostCache.clear();
+        hashTable.clear();
+    }
+
+    @Override
+    public CacheStats getStats() {
+        return new CacheStats(
+                globalHits.sum(),
+                globalMisses.sum(),
+                globalEvictions.sum(),
+                size(),
+                allocator.getUsedBytes(),
+                allocator.getTotalBytes());
+    }
+
     private void removeInternal(int keyHash, byte[] keyBytes, int keyLen, int slot, EvictionCause cause) {
         if (ghostCache != null)
             ghostCache.invalidate(keyHash);
@@ -596,8 +677,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             if (evictionListener != null) {
                 // Serialization of key for event?
                 K key = keySerializer.deserialize(keyBytes);
-                // Lazy value loading logic... for java we might just load it?
-                // Kotlin used lazy. Let's load eagerly or create supplier.
                 // Supplier is simple.
                 java.util.function.Supplier<V> valueLazy = () -> {
                     byte[] vBytes = entryPool.readValue(removedSlot);
@@ -607,6 +686,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
             evictionPolicy.onRemove(removedSlot);
             entryPool.free(removedSlot);
+
             if (cause != EvictionCause.EXPLICIT)
                 globalEvictions.increment();
         }
@@ -692,15 +772,19 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         byte[] keyBytes = null;
         int keyLen = 0;
         if (slot == 0) {
-            if (isLatin1Key && key instanceof String s) {
-                ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                keyBytes = res.buffer();
-                keyLen = res.length();
+            if (useKeyMatchFastPath) {
+                slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                keyBytes = keySerializer.serialize(key);
-                keyLen = keyBytes.length;
+                if (isLatin1Key && key instanceof String s) {
+                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                    keyBytes = res.buffer();
+                    keyLen = res.length();
+                } else {
+                    keyBytes = keySerializer.serialize(key);
+                    keyLen = keyBytes.length;
+                }
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
-            slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
         }
         if (slot == 0)
             return null;
@@ -737,15 +821,19 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         byte[] keyBytes = null;
         int keyLen = 0;
         if (slot == 0) {
-            if (isLatin1Key && key instanceof String s) {
-                ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                keyBytes = res.buffer();
-                keyLen = res.length();
+            if (useKeyMatchFastPath) {
+                slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                keyBytes = keySerializer.serialize(key);
-                keyLen = keyBytes.length;
+                if (isLatin1Key && key instanceof String s) {
+                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                    keyBytes = res.buffer();
+                    keyLen = res.length();
+                } else {
+                    keyBytes = keySerializer.serialize(key);
+                    keyLen = keyBytes.length;
+                }
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
-            slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
         }
         if (slot == 0)
             return null;
@@ -764,62 +852,17 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (offset == -1L)
             return null;
 
-        // Ported offset calculation
-        int storedKeyLen = NativeMemory.UNLIMITED.get(java.lang.foreign.ValueLayout.JAVA_INT, offset + 24);
-        long valueOffset = offset + 24 + 4 + com.codeabbot.rmcache.index.EntryBlockLayout.pad(storedKeyLen);
+        int storedKeyLen = NativeMemory.UNLIMITED.get(java.lang.foreign.ValueLayout.JAVA_INT,
+                offset + com.codeabbot.rmcache.index.EntryBlockLayout.HEADER_SIZE);
+        long valueOffset = offset + com.codeabbot.rmcache.index.EntryBlockLayout.HEADER_SIZE + 4
+                + com.codeabbot.rmcache.index.EntryBlockLayout.pad(storedKeyLen);
         int valueLen = NativeMemory.UNLIMITED.get(java.lang.foreign.ValueLayout.JAVA_INT, valueOffset);
 
         evictionPolicy.onAccess(slot, keyHash);
-        if (offHeapGhostCache != null)
+        if (hasOffHeapGhostCache)
             offHeapGhostCache.put(keyHash, slot);
 
         return new CacheValueViewImpl(entryPool, slot, valueOffset + 4, valueLen);
-    }
-
-    @Override
-    public CompletableFuture<Void> putAsync(K key, V value) {
-        return CompletableFuture.runAsync(() -> put(key, value));
-    }
-
-    @Override
-    public CompletableFuture<V> getAsync(K key) {
-        return CompletableFuture.supplyAsync(() -> get(key));
-    }
-
-    @Override
-    public boolean contains(K key) {
-        return get(key) != null;
-    }
-
-    @Override
-    public int size() {
-        return (int) hashTable.size();
-    }
-
-    @Override
-    public Set<K> getKeys() {
-        return Collections.emptySet();
-    }
-
-    @Override
-    public void clear() {
-        if (ghostCache != null)
-            ghostCache.invalidateAll();
-        if (offHeapGhostCache != null)
-            offHeapGhostCache.clear();
-        hashTable.clear();
-    }
-
-    @Override
-    public CacheStats getStats() {
-        CacheContext ctx = context.get();
-        return new CacheStats(
-                globalHits.sum() + ctx.hits,
-                globalMisses.sum() + ctx.misses,
-                globalEvictions.sum(),
-                size(),
-                allocator.getUsedBytes(),
-                allocator.getTotalBytes());
     }
 
     @Override

@@ -33,6 +33,7 @@ public class FuzzRobustnessTest {
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .offHeapMemory(64 * 1024 * 1024)
                 .maxEntries(10_000)
+                .backgroundEviction(false) // Synchronous eviction for test
                 .build();
 
         int numThreads = 8;
