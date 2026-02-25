@@ -333,6 +333,11 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             throw new IllegalStateException("Freeing pointer to unknown slab");
         }
 
+        // P2-O3 note: slab.isFull() before slab.free() is racy — two threads can
+        // both see wasFull=true, causing duplicate partialSlabs.offer() calls.
+        // This is harmless: ConcurrentLinkedQueue handles duplicates gracefully,
+        // and the extra dequeue on the allocation side is cheap. Locking around
+        // isFull+free would hurt the free-path latency disproportionately.
         boolean wasFull = slab.isFull();
         if (slab.free(offset)) {
             usedBytesCounter.add(-blockSize);

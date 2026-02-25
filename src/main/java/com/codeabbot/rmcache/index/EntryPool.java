@@ -329,6 +329,10 @@ public class EntryPool implements AutoCloseable {
             return;
         int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
         long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
+        // P2-M2 fix: Clamp length to actual value size to prevent reading
+        // garbage bytes from adjacent entry memory.
+        int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
+        length = Math.min(length, vLen);
         MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, buffer, bufferOffset, length);
     }
 

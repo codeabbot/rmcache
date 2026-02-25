@@ -725,7 +725,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public java.util.Map<K, V> getAll(java.util.Collection<K> keys) {
         checkNotClosed();
-        java.util.Map<K, V> result = new java.util.HashMap<>(keys.size());
+        // P2-O1 fix: Pre-size with load factor to avoid internal resizes
+        java.util.Map<K, V> result = new java.util.HashMap<>((int) (keys.size() / 0.75f) + 1);
         for (K key : keys) {
             V value = get(key);
             if (value != null) {
@@ -835,6 +836,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int filterRejects = 0; // Track consecutive filter rejections to avoid spin loops
         boolean forceOnce = force;
         int totalAttempts = 0; // H6 fix: hard cap to prevent unbounded blocking
+        // P2-M1 fix: Reusable metadata avoids anonymous class allocation per attempt
+        ReusableEntryMetadata meta = (evictionFilter != null) ? new ReusableEntryMetadata() : null;
         while (attempts < 100 && totalAttempts < 1000) {
             totalAttempts++;
             if (!forceOnce && !evictionPolicy.shouldEvict() && !isMemoryAboveLow()) {
@@ -854,33 +857,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             K key = keySerializer.deserialize(keyBytes);
 
             if (evictionFilter != null) {
-                final int s = slot;
-                EntryMetadata meta = new EntryMetadata() {
-                    @Override
-                    public short getPriority() {
-                        return entryPool.getPriority(s);
-                    }
-
-                    @Override
-                    public int getCreatedAtSeconds() {
-                        return 0;
-                    }
-
-                    @Override
-                    public int getExpiresAtSeconds() {
-                        return (int) (entryPool.getExpiresAt(s) / 1000);
-                    }
-
-                    @Override
-                    public long getAgeMillis() {
-                        return 0;
-                    }
-
-                    @Override
-                    public boolean isExpired() {
-                        return entryPool.isExpired(s);
-                    }
-                };
+                meta.setSlot(slot);
 
                 if (!evictionFilter.canEvict(key, meta)) {
                     evictionPolicy.onAdd(slot, keyHash, meta.getPriority());
@@ -903,6 +880,44 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     }
 
     /**
+     * P2-M1 fix: Reusable EntryMetadata implementation. One instance per eviction
+     * cycle instead of one anonymous class per eviction attempt. At 100 attempts
+     * × eviction every 10ms, this eliminates ~10K/sec short-lived objects.
+     */
+    private class ReusableEntryMetadata implements EntryMetadata {
+        private int slot;
+
+        void setSlot(int slot) {
+            this.slot = slot;
+        }
+
+        @Override
+        public short getPriority() {
+            return entryPool.getPriority(slot);
+        }
+
+        @Override
+        public int getCreatedAtSeconds() {
+            return 0;
+        }
+
+        @Override
+        public int getExpiresAtSeconds() {
+            return (int) (entryPool.getExpiresAt(slot) / 1000);
+        }
+
+        @Override
+        public long getAgeMillis() {
+            return 0;
+        }
+
+        @Override
+        public boolean isExpired() {
+            return entryPool.isExpired(slot);
+        }
+    }
+
+    /**
      * C3 warning: The MemorySegment passed to the processor points to LIVE off-heap
      * memory. If another thread evicts or updates (realloc) the same entry while
      * the
@@ -919,23 +934,49 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
 
         int slot = 0;
-        if (offHeapGhostCache != null) {
-            slot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-        }
-
         byte[] keyBytes = null;
         int keyLen = 0;
+        if (offHeapGhostCache != null) {
+            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            // P2-C2 fix: Re-validate ghost cache hit through hash table (same as get()),
+            // to prevent stale ghost entries returning a slot now owned by a different key.
+            if (ghostSlot != 0) {
+                int confirmedSlot;
+                if (useKeyMatchFastPath) {
+                    confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
+                } else {
+                    if (isLatin1Key && key instanceof String s) {
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
+                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+                }
+                if (confirmedSlot == ghostSlot) {
+                    slot = ghostSlot;
+                } else {
+                    offHeapGhostCache.invalidate(keyHash);
+                    slot = confirmedSlot;
+                }
+            }
+        }
+
         if (slot == 0) {
             if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                if (isLatin1Key && key instanceof String s) {
-                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                    keyBytes = res.buffer();
-                    keyLen = res.length();
-                } else {
-                    keyBytes = keySerializer.serialize(key);
-                    keyLen = keyBytes.length;
+                if (keyBytes == null) {
+                    if (isLatin1Key && key instanceof String s) {
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
                 }
                 slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }

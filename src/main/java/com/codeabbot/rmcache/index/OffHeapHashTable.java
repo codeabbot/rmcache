@@ -177,7 +177,7 @@ public class OffHeapHashTable implements AutoCloseable {
 
             if (storedHash == keyHash) {
                 int slot = (int) entry; // Slot is lower 32 bits
-                long offset = entryPool.getOffset(slot);
+                long offset = entryPool.getOffsetOpaque(slot);
                 if (offset != -1L) {
                     // Use keyEqualsWithLen since we don't store length in the table anymore
                     if (entryPool.keyEqualsWithLen(offset, keyBytes, keyLen)) {
@@ -224,7 +224,7 @@ public class OffHeapHashTable implements AutoCloseable {
 
             if (storedHash == keyHash) {
                 int slot = (int) entry;
-                long offset = entryPool.getOffset(slot);
+                long offset = entryPool.getOffsetOpaque(slot);
                 if (offset != -1L) {
                     if (entryPool.matchesAt(offset, key, serializer)) {
                         return slot;

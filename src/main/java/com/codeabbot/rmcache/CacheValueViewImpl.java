@@ -109,5 +109,9 @@ public class CacheValueViewImpl implements CacheValueView {
     private void checkValid() {
         if (closed.get())
             throw new IllegalStateException("CacheValueView has been closed");
+        // P2-C1 fix: Detect if underlying entry was freed by eviction or realloc.
+        // Without this, segment()/toByteArray()/getByte() silently read freed memory.
+        if (entryPool.getOffset(slot) == -1L)
+            throw new IllegalStateException("CacheValueView's underlying entry has been evicted or reallocated");
     }
 }
