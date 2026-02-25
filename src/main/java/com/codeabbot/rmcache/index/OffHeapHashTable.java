@@ -5,6 +5,7 @@ import com.codeabbot.rmcache.util.Prefetch;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.locks.StampedLock;
 
 /**
@@ -28,7 +29,8 @@ public class OffHeapHashTable implements AutoCloseable {
     private final long[] tableAddrs;
     private final int[] tableMasks;
     private final int[] tableCapacities;
-    private final int[] tableCounts;
+    // C2 fix: AtomicIntegerArray ensures visibility of count updates on ARM
+    private final AtomicIntegerArray tableCounts;
     private final StampedLock[] tableLocks;
     private final MemorySegment[] tableSegments;
 
@@ -65,7 +67,7 @@ public class OffHeapHashTable implements AutoCloseable {
         this.tableAddrs = new long[powerOf2];
         this.tableMasks = new int[powerOf2];
         this.tableCapacities = new int[powerOf2];
-        this.tableCounts = new int[powerOf2];
+        this.tableCounts = new AtomicIntegerArray(powerOf2);
         this.tableLocks = new StampedLock[powerOf2];
         this.tableSegments = new MemorySegment[powerOf2];
 
@@ -268,7 +270,7 @@ public class OffHeapHashTable implements AutoCloseable {
         // Standard write path for new inserts or failed optimistic reads
         long stamp = lock.writeLock();
         try {
-            if (tableCounts[sIdx] >= (int) (tableCapacities[sIdx] * loadFactor)) {
+            if (tableCounts.get(sIdx) >= (int) (tableCapacities[sIdx] * loadFactor)) {
                 resize(sIdx);
             }
 
@@ -289,7 +291,7 @@ public class OffHeapHashTable implements AutoCloseable {
 
                 if (existingEntry == 0L) {
                     NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, entryAddr, currEntry);
-                    tableCounts[sIdx]++;
+                    tableCounts.incrementAndGet(sIdx);
                     return 0;
                 }
 
@@ -357,7 +359,7 @@ public class OffHeapHashTable implements AutoCloseable {
                     long offset = entryPool.getOffset(slot);
                     if (entryPool.keyEqualsWithLen(offset, keyBytes, keyBytes.length)) {
                         backwardShift(tableAddr, index, mask, cap);
-                        tableCounts[sIdx]--;
+                        tableCounts.decrementAndGet(sIdx);
                         return slot;
                     }
                     if (++sameHashProbes >= MAX_SAME_HASH_PROBE) {
@@ -456,12 +458,24 @@ public class OffHeapHashTable implements AutoCloseable {
         tableAddrs[sIdx] = newAddr;
         tableCapacities[sIdx] = newCap;
         tableMasks[sIdx] = newMask;
+
+        // M3 fix: Inline-drain retired segments past the grace period to prevent
+        // unbounded queue growth during burst resizes.
+        long now = System.nanoTime();
+        long graceNanos = 500_000_000L;
+        Object[] retired;
+        while ((retired = retiredSegments.peek()) != null) {
+            if (now - (long) retired[0] < graceNanos)
+                break;
+            retiredSegments.poll();
+            NativeMemory.free((MemorySegment) retired[1]);
+        }
     }
 
     public long size() {
         long sum = 0;
-        for (int c : tableCounts)
-            sum += c;
+        for (int i = 0; i < tableCounts.length(); i++)
+            sum += tableCounts.get(i);
         return sum;
     }
 
@@ -491,7 +505,7 @@ public class OffHeapHashTable implements AutoCloseable {
                 MemorySegment seg = NativeMemory.calloc(cap, SLOT_SIZE);
                 tableSegments[i] = seg;
                 tableAddrs[i] = seg.address();
-                tableCounts[i] = 0;
+                tableCounts.set(i, 0);
             } finally {
                 lock.unlockWrite(stamp);
             }

@@ -25,6 +25,13 @@ public interface EvictionPolicy extends AutoCloseable {
     default void drainBuffers() {
     }
 
+    /**
+     * M1: Compact internal data structures (e.g., timing wheel lazy-cancelled
+     * entries)
+     */
+    default void compact() {
+    }
+
     /** Number of entries tracked */
     int size();
 

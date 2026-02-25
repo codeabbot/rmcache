@@ -75,6 +75,11 @@ public class CompositePolicy implements EvictionPolicy {
     }
 
     @Override
+    public void compact() {
+        policies.forEach(EvictionPolicy::compact);
+    }
+
+    @Override
     public void setEntryPool(EntryPool pool) {
         policies.forEach(p -> p.setEntryPool(pool));
     }

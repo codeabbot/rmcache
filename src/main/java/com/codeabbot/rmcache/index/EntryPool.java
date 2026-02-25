@@ -131,6 +131,16 @@ public class EntryPool implements AutoCloseable {
         return (packed == -1L) ? -1L : unpackAddr(packed);
     }
 
+    /**
+     * O1 fix: Opaque read of offset — avoids volatile barrier on ARM hot path.
+     * Safe for read-only callers (get) since the write side uses setVolatile.
+     * Provides at-least-opaque ordering which guarantees no word tearing.
+     */
+    public long getOffsetOpaque(int slot) {
+        long packed = (long) LONG_HANDLE.getOpaque(offsets, (long) slot * 8L);
+        return (packed == -1L) ? -1L : unpackAddr(packed);
+    }
+
     public int getSlotFromOffset(long offset) {
         return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 12);
     }
@@ -160,21 +170,26 @@ public class EntryPool implements AutoCloseable {
 
     /**
      * Fast key comparison using long-word (8 bytes at a time) reads.
-     * For a 16-byte key, this does 2 reads instead of 16.
+     * O2 fix: Reads longs from byte[] via manual packing to avoid
+     * MemorySegment.ofArray() allocation on every call.
      */
     private static boolean compareKeyBytes(long keyStart, byte[] keyBytes, int keyLen) {
         int i = 0;
         // Compare 8 bytes at a time using long-word reads
-        if (keyLen >= 8) {
-            MemorySegment keySegment = MemorySegment.ofArray(keyBytes);
-            for (; i + 8 <= keyLen; i += 8) {
-                long offHeapWord = NativeMemory.UNLIMITED.get(UNALIGNED_LONG, keyStart + i);
-                long onHeapWord = keySegment.get(UNALIGNED_LONG, i);
-                if (offHeapWord != onHeapWord)
-                    return false;
-            }
+        for (; i + 8 <= keyLen; i += 8) {
+            long offHeapWord = NativeMemory.UNLIMITED.get(UNALIGNED_LONG, keyStart + i);
+            long onHeapWord = ((long) (keyBytes[i] & 0xFF)) |
+                    ((long) (keyBytes[i + 1] & 0xFF) << 8) |
+                    ((long) (keyBytes[i + 2] & 0xFF) << 16) |
+                    ((long) (keyBytes[i + 3] & 0xFF) << 24) |
+                    ((long) (keyBytes[i + 4] & 0xFF) << 32) |
+                    ((long) (keyBytes[i + 5] & 0xFF) << 40) |
+                    ((long) (keyBytes[i + 6] & 0xFF) << 48) |
+                    ((long) (keyBytes[i + 7] & 0xFF) << 56);
+            if (offHeapWord != onHeapWord)
+                return false;
         }
-        // Compare remaining bytes (0-7 tail bytes) — no segment wrapper needed
+        // Compare remaining bytes (0-7 tail bytes)
         for (; i < keyLen; i++) {
             if (NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, keyStart + i) != keyBytes[i])
                 return false;
@@ -496,14 +511,10 @@ public class EntryPool implements AutoCloseable {
                 long relOffset = absOffset - baseAddr;
                 allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
 
-                while (true) {
-                    int top = freeTop.get();
-                    if (freeTop.compareAndSet(top, top + 1)) {
-                        freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
-                        break;
-                    }
-                    Thread.onSpinWait(); // M4 fix: Reduce CPU contention on CAS retry
-                }
+                // H1 fix: Use getAndIncrement instead of CAS loop to avoid
+                // spin-locking under extreme contention with 128+ threads.
+                int top = freeTop.getAndIncrement();
+                freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
             }
         }
 

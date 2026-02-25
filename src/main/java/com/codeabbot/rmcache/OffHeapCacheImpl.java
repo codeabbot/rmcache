@@ -172,6 +172,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
         }, 100, 100, TimeUnit.MILLISECONDS);
 
+        // M1 fix: Periodically compact eviction policy internal structures
+        // (e.g., timing wheel lazy-cancelled entries) to prevent unbounded growth.
+        maintenanceExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                evictionPolicy.compact();
+            } catch (Throwable e) {
+                logger.error("Error during eviction policy compaction", e);
+            }
+        }, 60_000, 60_000, TimeUnit.MILLISECONDS);
+
         if (backgroundEviction) {
             evictionExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "rmcache-eviction");
@@ -591,6 +601,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             int valLen = entryPool.getValueLen(slot);
             byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
+            // C1 fix: Post-read validation — if slot was freed while we were
+            // copying bytes, the data may be corrupt. Re-check offset.
+            if (entryPool.getOffset(slot) == -1L)
+                return null;
             @SuppressWarnings("unchecked")
             V res = (V) Arrays.copyOf(vBuf, valLen);
             return res;
@@ -600,10 +614,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             int valLen = entryPool.getValueLen(slot);
             byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
+            // C1 fix: Post-read validation
+            if (entryPool.getOffset(slot) == -1L)
+                return null;
             return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
 
         byte[] valBytes = entryPool.readValue(slot);
+        // C1 fix: Post-read validation
+        if (entryPool.getOffset(slot) == -1L)
+            return null;
         return valueSerializer.deserialize(valBytes);
     }
 
@@ -715,6 +735,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return result;
     }
 
+    // H3 note: putAsync/getAsync delegate to ForkJoinPool.commonPool() which has
+    // an unbounded submission queue. At 1B-scale throughput (millions of async
+    // ops/sec), this can create GC pressure and latency spikes. For production
+    // use at scale, prefer synchronous put/get or provide a bounded executor.
+    // TODO: Accept an optional Executor via CacheBuilder for async operations.
     @Override
     public CompletableFuture<Void> putAsync(K key, V value) {
         return CompletableFuture.runAsync(() -> put(key, value));

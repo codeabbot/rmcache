@@ -47,12 +47,13 @@ public final class CoarseClock {
      * Stops the clock thread when the last reference is released.
      */
     public static void release() {
-        if (refCount.decrementAndGet() == 0) {
-            synchronized (LOCK) {
-                if (refCount.get() == 0 && clockExecutor != null) {
-                    clockExecutor.shutdown();
-                    clockExecutor = null;
-                }
+        // C5 fix: Perform decrement inside synchronized to prevent race where
+        // concurrent acquire() starts the executor between our decrement and
+        // the shutdown, causing the newly started executor to be killed.
+        synchronized (LOCK) {
+            if (refCount.decrementAndGet() == 0 && clockExecutor != null) {
+                clockExecutor.shutdown();
+                clockExecutor = null;
             }
         }
     }

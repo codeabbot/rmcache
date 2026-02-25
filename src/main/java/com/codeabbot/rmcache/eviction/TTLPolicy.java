@@ -144,6 +144,16 @@ public class TTLPolicy implements EvictionPolicy {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    /**
+     * M1 fix: Compact the timing wheel by removing lazily-cancelled entries.
+     * Prevents unbounded native heap growth in long-running caches with TTL churn.
+     */
+    @Override
+    public void compact() {
+        if (wheel != null)
+            wheel.compact();
+    }
+
     @Override
     public void close() {
         if (wheel != null)
