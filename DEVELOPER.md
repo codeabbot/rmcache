@@ -174,14 +174,13 @@ Heap ≈ FixedOverhead (~1.5 MB)
 
 ## Performance Characteristics
 
-Measured on a development machine, 4 threads, JDK 25 (3 warmup + 3 measurement JMH iterations):
+Measured on a development machine, 4 threads, JDK 25 (1 warmup + 2 measurement JMH iterations):
 
 | Scale | GET Latency | PUT Latency |
 |-------|------------|------------|
-| 10K entries | ~140 ns | ~275 ns |
-| 100K entries | ~307 ns | ~446 ns |
-| 1M entries | ~564 ns | ~566 ns |
-| 10M entries | ~700 ns | ~687 ns |
+| 10K entries | ~151 ns | ~170 ns |
+| 100K entries | ~308 ns | ~350 ns |
+| 1M entries | ~488 ns | ~487 ns |
 
 ### Performance Tips
 
