@@ -41,7 +41,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
     private final LongAdder allocationCount = new LongAdder();
     private final LongAdder freeCount = new LongAdder();
-    private final AtomicLong usedBytesCounter = new AtomicLong(0);
+    private final LongAdder usedBytesCounter = new LongAdder();
 
     public MemorySegment getSegment() {
         return segment;
@@ -88,7 +88,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
     @Override
     public long getUsedBytes() {
-        return usedBytesCounter.get();
+        return usedBytesCounter.sum();
     }
 
     @Override
@@ -112,7 +112,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             long offset = active.allocate();
             if (offset >= 0) {
                 allocationCount.add(1);
-                usedBytesCounter.addAndGet(blockSize);
+                usedBytesCounter.add(blockSize);
                 return new AllocationHandle(segment, offset, blockSize, classIndex);
             }
         }
@@ -125,7 +125,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
                 long offset = currentActive.allocate();
                 if (offset >= 0) {
                     allocationCount.add(1);
-                    usedBytesCounter.addAndGet(blockSize);
+                    usedBytesCounter.add(blockSize);
                     return new AllocationHandle(segment, offset, blockSize, classIndex);
                 }
                 state.activeSlab.compareAndSet(currentActive, null);
@@ -134,9 +134,17 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             LockFreeSlabManager replacement = state.partialSlabs.poll();
 
             if (replacement == null) {
-                long newOffset = nextSlabOffset.getAndAdd(slabSize);
-                if (newOffset + slabSize > slabRegionSize) {
-                    throw new IllegalStateException("Out of memory: Slab Region Full");
+                // K5: CAS loop — only advance offset on success
+                long newOffset;
+                while (true) {
+                    newOffset = nextSlabOffset.get();
+                    if (newOffset + slabSize > slabRegionSize) {
+                        // H2 fix: Return null instead of throwing, consistent
+                        // with allocatePacked() which returns -1L.
+                        return null;
+                    }
+                    if (nextSlabOffset.compareAndSet(newOffset, newOffset + slabSize))
+                        break;
                 }
 
                 replacement = new LockFreeSlabManager(segment, newOffset, blockSize, slabSize);
@@ -152,7 +160,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
                 long offset = replacement.allocate();
                 if (offset >= 0) {
                     allocationCount.add(1);
-                    usedBytesCounter.addAndGet(blockSize);
+                    usedBytesCounter.add(blockSize);
                     return new AllocationHandle(segment, offset, blockSize, classIndex);
                 }
             } else {
@@ -173,7 +181,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             }
             largeAllocations.put(offset, sizeBytes);
             allocationCount.add(1);
-            usedBytesCounter.addAndGet(sizeBytes);
+            usedBytesCounter.add(sizeBytes);
             return new AllocationHandle(segment, offset, sizeBytes, -1);
         } finally {
             largeLock.unlock();
@@ -198,7 +206,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
         boolean wasFull = slab.isFull();
         if (slab.free(handle.getOffset())) {
-            usedBytesCounter.addAndGet(-blockSize);
+            usedBytesCounter.add(-blockSize);
             if (wasFull) {
                 classStates[classIndex].partialSlabs.offer(slab);
             }
@@ -210,7 +218,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         try {
             Integer size = largeAllocations.remove(handle.getOffset());
             if (size != null) {
-                usedBytesCounter.addAndGet(-size);
+                usedBytesCounter.add(-size);
                 buddyAllocator.free(handle.getOffset(), size);
             }
         } finally {
@@ -243,7 +251,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             long offset = active.allocate();
             if (offset >= 0) {
                 allocationCount.add(1);
-                usedBytesCounter.addAndGet(blockSize);
+                usedBytesCounter.add(blockSize);
                 return AllocationHandle.pack(offset, blockSize, classIndex);
             }
         }
@@ -255,7 +263,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
                 long offset = currentActive.allocate();
                 if (offset >= 0) {
                     allocationCount.add(1);
-                    usedBytesCounter.addAndGet(blockSize);
+                    usedBytesCounter.add(blockSize);
                     return AllocationHandle.pack(offset, blockSize, classIndex);
                 }
                 state.activeSlab.compareAndSet(currentActive, null);
@@ -263,9 +271,15 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
             LockFreeSlabManager replacement = state.partialSlabs.poll();
             if (replacement == null) {
-                long newOffset = nextSlabOffset.getAndAdd(slabSize);
-                if (newOffset + slabSize > slabRegionSize) {
-                    return -1L;
+                // K5: CAS loop — only advance offset on success
+                long newOffset;
+                while (true) {
+                    newOffset = nextSlabOffset.get();
+                    if (newOffset + slabSize > slabRegionSize) {
+                        return -1L;
+                    }
+                    if (nextSlabOffset.compareAndSet(newOffset, newOffset + slabSize))
+                        break;
                 }
                 replacement = new LockFreeSlabManager(segment, newOffset, blockSize, slabSize);
                 int slabIdx = (int) (newOffset / slabSize);
@@ -280,7 +294,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
                 long offset = replacement.allocate();
                 if (offset >= 0) {
                     allocationCount.add(1);
-                    usedBytesCounter.addAndGet(blockSize);
+                    usedBytesCounter.add(blockSize);
                     return AllocationHandle.pack(offset, blockSize, classIndex);
                 }
             } else {
@@ -303,7 +317,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
             try {
                 Integer size = largeAllocations.remove(offset);
                 if (size != null) {
-                    usedBytesCounter.addAndGet(-size);
+                    usedBytesCounter.add(-size);
                     buddyAllocator.free(offset, size);
                 }
             } finally {
@@ -321,7 +335,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
         boolean wasFull = slab.isFull();
         if (slab.free(offset)) {
-            usedBytesCounter.addAndGet(-blockSize);
+            usedBytesCounter.add(-blockSize);
             if (wasFull) {
                 classStates[sc].partialSlabs.offer(slab);
             }
@@ -347,6 +361,10 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
 
     @Override
     public void close() {
+        // L3 fix: Free buddy allocator's bitmap segment before main segment.
+        if (buddyAllocator != null) {
+            buddyAllocator.close();
+        }
         if (segment != null) {
             NativeMemory.free(segment);
         }

@@ -8,7 +8,7 @@ import com.codeabbot.rmcache.index.OffHeapHashTable;
 import com.codeabbot.rmcache.memory.SlabAllocator;
 import com.codeabbot.rmcache.serializer.*;
 import com.codeabbot.rmcache.util.MemoryEstimator;
-import io.micrometer.core.instrument.MeterRegistry;
+
 import java.time.Duration;
 
 /**
@@ -42,7 +42,7 @@ public class CacheBuilder<K, V> {
     private EvictionListener<K, V> evictionListener = null;
     private EvictionFilter<K> evictionFilter = null;
     private boolean zeroMemory = false;
-    private MeterRegistry meterRegistry = null;
+
     private String cacheName = "rmcache";
 
     private boolean backgroundEviction = true;
@@ -151,6 +151,10 @@ public class CacheBuilder<K, V> {
     }
 
     public CacheBuilder<K, V> slabSize(int bytes) {
+        if (bytes < 4096)
+            throw new IllegalArgumentException("slabSize must be >= 4096, got " + bytes);
+        if ((bytes & (bytes - 1)) != 0)
+            throw new IllegalArgumentException("slabSize must be power of 2, got " + bytes);
         this.slabSize = bytes;
         return this;
     }
@@ -189,11 +193,6 @@ public class CacheBuilder<K, V> {
 
     public CacheBuilder<K, V> zeroMemoryOnStartup() {
         this.zeroMemory = true;
-        return this;
-    }
-
-    public CacheBuilder<K, V> withMeterRegistry(MeterRegistry registry) {
-        this.meterRegistry = registry;
         return this;
     }
 
@@ -276,29 +275,63 @@ public class CacheBuilder<K, V> {
         ValueSerializer<V> vSer = (valueSerializer != null) ? valueSerializer
                 : (ValueSerializer<V>) BuiltInSerializers.STRING_VALUE;
 
-        SlabAllocator allocator = new SlabAllocator(finalMemory, slabSize);
-        EntryPool entryPool = new EntryPool(allocator, maxEntries, partitions);
-        OffHeapHashTable hashTable = new OffHeapHashTable(entryPool, finalMemory, stripes, prefetch,
-                initialCapacity, loadFactor);
-        EvictionPolicy policy = (evictionPolicy != null) ? evictionPolicy
-                : new LRUPolicy(maxEntries, entryPool.slotCapacity(), 0.01f, 0.80f);
-        policy.setEntryPool(entryPool);
-
-        GhostCache<K, V> ghostCache = null;
+        SlabAllocator allocator = null;
+        EntryPool entryPool = null;
+        OffHeapHashTable hashTable = null;
+        EvictionPolicy policy = null;
         OffHeapGhostCache offHeapGhostCache = null;
-        if (ghostSize > 0 && effectiveGhostMode != GhostCacheMode.DISABLED) {
-            if (effectiveGhostMode == GhostCacheMode.HEAP) {
-                ghostCache = new GhostCache<>(ghostSize);
-            } else {
-                offHeapGhostCache = new OffHeapGhostCache(ghostSize);
-            }
-        }
+        try {
+            allocator = new SlabAllocator(finalMemory, slabSize);
+            entryPool = new EntryPool(allocator, maxEntries, partitions);
+            hashTable = new OffHeapHashTable(entryPool, finalMemory, stripes, prefetch,
+                    initialCapacity, loadFactor);
+            policy = (evictionPolicy != null) ? evictionPolicy
+                    : new LRUPolicy(maxEntries, entryPool.slotCapacity(), 0.01f, 0.80f);
+            policy.setEntryPool(entryPool);
 
-        OffHeapCacheImpl<K, V> cache = new OffHeapCacheImpl<>(
-                kSer, vSer, allocator, entryPool, hashTable, policy,
-                evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
-                backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark);
-        return cache;
+            GhostCache<K, V> ghostCache = null;
+            if (ghostSize > 0 && effectiveGhostMode != GhostCacheMode.DISABLED) {
+                if (effectiveGhostMode == GhostCacheMode.HEAP) {
+                    ghostCache = new GhostCache<>(ghostSize);
+                } else {
+                    offHeapGhostCache = new OffHeapGhostCache(ghostSize);
+                }
+            }
+
+            OffHeapCacheImpl<K, V> cache = new OffHeapCacheImpl<>(
+                    kSer, vSer, allocator, entryPool, hashTable, policy,
+                    evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
+                    backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark);
+            return cache;
+        } catch (Throwable t) {
+            // Clean up partially allocated native resources
+            if (offHeapGhostCache != null)
+                try {
+                    offHeapGhostCache.close();
+                } catch (Exception ignored) {
+                }
+            if (policy != null)
+                try {
+                    policy.close();
+                } catch (Exception ignored) {
+                }
+            if (hashTable != null)
+                try {
+                    hashTable.close();
+                } catch (Exception ignored) {
+                }
+            if (entryPool != null)
+                try {
+                    entryPool.close();
+                } catch (Exception ignored) {
+                }
+            if (allocator != null)
+                try {
+                    allocator.close();
+                } catch (Exception ignored) {
+                }
+            throw t;
+        }
     }
 
     public MemoryEstimator.MemoryEstimate estimateMemory() {

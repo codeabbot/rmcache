@@ -244,4 +244,11 @@ class BuddyAllocator {
         long val = bitmapSegment.get(ValueLayout.JAVA_LONG, addr);
         return (val & mask) != 0;
     }
+
+    // L3 fix: Free the off-heap bitmap segment to prevent memory leak.
+    public void close() {
+        if (bitmapSegment != null) {
+            NativeMemory.free(bitmapSegment);
+        }
+    }
 }

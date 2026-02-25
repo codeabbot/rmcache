@@ -18,7 +18,7 @@ public class OffHeapHashTableTest {
         int slot = pool.allocateWithLen(hash, keyBytes, keyBytes.length, "val".getBytes(), 3, (short) 0, 0);
 
         // PutWithLen
-        hashTable.putWithLen(hash, keyBytes, keyBytes.length, slot);
+        hashTable.putEntry(hash, keyBytes, keyBytes.length, slot, false);
 
         // GetWithLen
         int retSlot = hashTable.getWithLen(hash, keyBytes, keyBytes.length);
@@ -29,6 +29,7 @@ public class OffHeapHashTableTest {
         assertEquals(slot, removed);
         assertEquals(0, hashTable.getWithLen(hash, keyBytes, keyBytes.length));
 
+        hashTable.close();
         allocator.close();
     }
 
@@ -48,12 +49,13 @@ public class OffHeapHashTableTest {
         int s1 = pool.allocateWithLen(h, k1, k1Len, "v1".getBytes(), 2, (short) 0, 0);
         int s2 = pool.allocateWithLen(h, k2, k2Len, "v2".getBytes(), 2, (short) 0, 0);
 
-        hashTable.putWithLen(h, k1, k1Len, s1);
-        hashTable.putWithLen(h, k2, k2Len, s2);
+        hashTable.putEntry(h, k1, k1Len, s1, false);
+        hashTable.putEntry(h, k2, k2Len, s2, false);
 
         assertEquals(s1, hashTable.getWithLen(h, k1, k1Len));
         assertEquals(s2, hashTable.getWithLen(h, k2, k2Len));
 
+        hashTable.close();
         allocator.close();
     }
 
@@ -70,7 +72,7 @@ public class OffHeapHashTableTest {
             byte[] k = ("key-" + i).getBytes();
             int h = i; // Simple hash
             int s = pool.allocateWithLen(h, k, k.length, "v".getBytes(), 1, (short) 0, 0);
-            hashTable.putWithLen(h, k, k.length, s);
+            hashTable.putEntry(h, k, k.length, s, false);
         }
 
         assertEquals(500, hashTable.size());
@@ -83,6 +85,7 @@ public class OffHeapHashTableTest {
             assertTrue(s > 0, "Key " + i + " not found");
         }
 
+        hashTable.close();
         allocator.close();
     }
 
@@ -96,27 +99,28 @@ public class OffHeapHashTableTest {
         int negHash = -12345;
         byte[] k1 = "negHash".getBytes();
         int s1 = pool.allocateWithLen(negHash, k1, k1.length, "v".getBytes(), 1, (short) 0, 0);
-        hashTable.putWithLen(negHash, k1, k1.length, s1);
+        hashTable.putEntry(negHash, k1, k1.length, s1, false);
         assertEquals(s1, hashTable.getWithLen(negHash, k1, k1.length));
 
         // Case 2: Max Integer Hash
         int maxHash = Integer.MAX_VALUE;
         byte[] k2 = "maxHash".getBytes();
         int s2 = pool.allocateWithLen(maxHash, k2, k2.length, "v".getBytes(), 1, (short) 0, 0);
-        hashTable.putWithLen(maxHash, k2, k2.length, s2);
+        hashTable.putEntry(maxHash, k2, k2.length, s2, false);
         assertEquals(s2, hashTable.getWithLen(maxHash, k2, k2.length));
 
         // Case 3: Min Integer Hash
         int minHash = Integer.MIN_VALUE;
         byte[] k3 = "minHash".getBytes();
         int s3 = pool.allocateWithLen(minHash, k3, k3.length, "v".getBytes(), 1, (short) 0, 0);
-        hashTable.putWithLen(minHash, k3, k3.length, s3);
+        hashTable.putEntry(minHash, k3, k3.length, s3, false);
         assertEquals(s3, hashTable.getWithLen(minHash, k3, k3.length));
 
         // Case 4: Verify separation (ensure slots don't bleed into hash)
         // We can't easily force a specific large Slot ID without hacking EntryPool,
         // but normal usage with these hashes verifies basic packing.
 
+        hashTable.close();
         allocator.close();
     }
 }

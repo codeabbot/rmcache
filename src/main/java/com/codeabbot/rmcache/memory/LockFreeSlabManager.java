@@ -56,8 +56,12 @@ class LockFreeSlabManager {
             return -1L;
         }
 
-        // Scan bitmap words for free slots
-        for (int wordIdx = 0; wordIdx < numWords; wordIdx++) {
+        // Thread-local scan start to avoid cache-line contention on a shared hint
+        int hint = (int) (Thread.currentThread().threadId() % numWords);
+        if (hint < 0)
+            hint += numWords;
+        for (int i = 0; i < numWords; i++) {
+            int wordIdx = (hint + i) % numWords;
             int attempts = 0;
             while (attempts < 64) { // Limit retries per word
                 long word = bitmap.get(wordIdx);

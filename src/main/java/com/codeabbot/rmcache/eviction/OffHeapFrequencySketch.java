@@ -3,6 +3,8 @@ package com.codeabbot.rmcache.eviction;
 import com.codeabbot.rmcache.memory.NativeMemory;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Off-Heap implementation of FrequencySketch (Count-Min Sketch).
@@ -13,7 +15,8 @@ import java.lang.foreign.ValueLayout;
 class OffHeapFrequencySketch implements AutoCloseable {
     private final MemorySegment table;
     private final int tableMask;
-    private int sampleSize = 0;
+    private final AtomicInteger sampleSize = new AtomicInteger(0); // H2 fix: atomic to prevent race
+    private final AtomicBoolean resetting = new AtomicBoolean(false); // H2 fix: single-writer reset guard
     private final int resetThreshold;
     private final int tableSize;
 
@@ -52,8 +55,15 @@ class OffHeapFrequencySketch implements AutoCloseable {
         incrementAt(index2, slot2);
         incrementAt(index3, slot3);
 
-        if (++sampleSize >= resetThreshold) {
-            reset();
+        // H2 fix: atomic increment + CAS-guarded reset
+        if (sampleSize.incrementAndGet() >= resetThreshold) {
+            if (resetting.compareAndSet(false, true)) {
+                try {
+                    reset();
+                } finally {
+                    resetting.set(false);
+                }
+            }
         }
     }
 
@@ -79,7 +89,7 @@ class OffHeapFrequencySketch implements AutoCloseable {
             long val = table.get(ValueLayout.JAVA_LONG, (long) i * 8);
             table.set(ValueLayout.JAVA_LONG, (long) i * 8, (val >>> 1) & RESET_MASK);
         }
-        sampleSize >>>= 1;
+        sampleSize.updateAndGet(v -> v >>> 1);
     }
 
     private void incrementAt(int tableIndex, int slot) {

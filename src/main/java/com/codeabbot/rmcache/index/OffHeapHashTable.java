@@ -32,8 +32,9 @@ public class OffHeapHashTable implements AutoCloseable {
     private final StampedLock[] tableLocks;
     private final MemorySegment[] tableSegments;
 
-    // Async cleanup queue for retired tables (drained by LRU executor)
-    private final ConcurrentLinkedQueue<MemorySegment> cleanupQueue = new ConcurrentLinkedQueue<>();
+    // Async cleanup queue for retired tables — entries are timestamped for
+    // grace-period reclamation
+    private final ConcurrentLinkedQueue<Object[]> retiredSegments = new ConcurrentLinkedQueue<>();
 
     private static final int SLOT_SIZE = 8; // 8 bytes packed: Top 32 bits Hash, Bottom 32 bits SlotID
     private static final int MAX_SAME_HASH_PROBE = 32;
@@ -87,7 +88,11 @@ public class OffHeapHashTable implements AutoCloseable {
                 NativeMemory.free(seg);
             }
         }
-        drainCleanupQueue();
+        // Force-drain all retired segments on close (no grace period needed)
+        Object[] entry;
+        while ((entry = retiredSegments.poll()) != null) {
+            NativeMemory.free((MemorySegment) entry[1]);
+        }
     }
 
     // Fast-path get
@@ -219,7 +224,7 @@ public class OffHeapHashTable implements AutoCloseable {
                 int slot = (int) entry;
                 long offset = entryPool.getOffset(slot);
                 if (offset != -1L) {
-                    if (entryPool.matches(slot, key, serializer)) {
+                    if (entryPool.matchesAt(offset, key, serializer)) {
                         return slot;
                     }
                 }
@@ -238,24 +243,25 @@ public class OffHeapHashTable implements AutoCloseable {
         }
     }
 
-    public int putWithLen(int keyHash, byte[] keyBytes, int keyLen, int slot) {
+    public int putEntry(int keyHash, byte[] keyBytes, int keyLen, int slot, boolean putIfAbsent) {
         int sIdx = (keyHash >>> stripeShift) & stripeMask;
         StampedLock lock = tableLocks[sIdx];
 
-        // Optimistic path: check if key exists first (for updates)
-        long optimisticStamp = lock.tryOptimisticRead();
-        if (optimisticStamp != 0L) {
-            long tableAddr = tableAddrs[sIdx];
-            int mask = tableMasks[sIdx];
-            int cap = tableCapacities[sIdx];
+        if (putIfAbsent) {
+            // Optimistic path: check if key exists first (for updates)
+            long optimisticStamp = lock.tryOptimisticRead();
+            if (optimisticStamp != 0L) {
+                long tableAddr = tableAddrs[sIdx];
+                int mask = tableMasks[sIdx];
+                int cap = tableCapacities[sIdx];
 
-            int existingSlot = probeWithParams(tableAddr, mask, cap, keyHash, keyBytes, keyLen);
+                int existingSlot = probeWithParams(tableAddr, mask, cap, keyHash, keyBytes, keyLen);
 
-            // If key exists and optimistic read validates, this is an update
-            if (existingSlot > 0 && lock.validate(optimisticStamp)) {
-                // Key exists - this is an update, return the existing slot
-                // The caller will handle replacing the value in the entry pool
-                return existingSlot;
+                // If key exists and optimistic read validates, this is an update
+                if (existingSlot > 0 && lock.validate(optimisticStamp)) {
+                    // Key exists - this is an update, return the existing slot
+                    return existingSlot;
+                }
             }
         }
 
@@ -293,7 +299,12 @@ public class OffHeapHashTable implements AutoCloseable {
                     int existingSlot = (int) existingEntry;
                     long offset = entryPool.getOffset(existingSlot);
                     if (entryPool.keyEqualsWithLen(offset, keyBytes, keyLen)) {
-                        return existingSlot; // Duplicate found
+                        if (putIfAbsent) {
+                            return existingSlot; // Duplicate found, return old slot
+                        } else {
+                            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, entryAddr, currEntry);
+                            return existingSlot; // Overwritten, return old slot so caller can free it
+                        }
                     }
                     if (++sameHashProbes >= MAX_SAME_HASH_PROBE) {
                         return -1;
@@ -309,23 +320,6 @@ public class OffHeapHashTable implements AutoCloseable {
                     NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, entryAddr, currEntry);
                     currEntry = tempEntry;
                     dist = existingDist;
-                    // Hash for distance calculation logic update?
-                    // "existingHash" derived from "existingEntry" is accurate for the swapped-out
-                    // item.
-                    // But we need to make sure we don't lose the implicit relationship during loop.
-                    // Actually, "existingHash" variable is local to loop iteration,
-                    // but we need to derive "keyHash" for the *new* floating item (currEntry) for
-                    // next
-                    // iter.
-                    // Oh, right: "keyHash" parameter was for the ORIGINAL item.
-                    // But now "currEntry" is the item moving. We need its hash.
-                    // So we must unpack "currEntry" to update "keyHash" logic?
-                    // No, "dist" tracks the distance of "currEntry".
-                    // But "ideal" for NEXT iteration depends on the hash of "currEntry".
-                    // Wait. "index" increments. "dist" increments.
-                    // The loop continues inserting "currEntry".
-                    // We don't need "keyHash" anymore for distance check of *other* items?
-                    // Correct. We just need to know "currEntry" needs a home.
                 }
 
                 index = (index + 1) & mask;
@@ -457,7 +451,7 @@ public class OffHeapHashTable implements AutoCloseable {
             }
         }
 
-        cleanupQueue.offer(tableSegments[sIdx]);
+        retiredSegments.offer(new Object[] { System.nanoTime(), tableSegments[sIdx] });
         tableSegments[sIdx] = newTable;
         tableAddrs[sIdx] = newAddr;
         tableCapacities[sIdx] = newCap;
@@ -472,10 +466,18 @@ public class OffHeapHashTable implements AutoCloseable {
     }
 
     public void drainCleanupQueue() {
-        MemorySegment seg = cleanupQueue.poll();
-        while (seg != null) {
-            NativeMemory.free(seg);
-            seg = cleanupQueue.poll();
+        // Grace period: delay freeing retired tables to avoid use-after-free
+        // by optimistic readers that captured a stale tableAddr before resize.
+        long now = System.nanoTime();
+        long graceNanos = 500_000_000L; // 500ms
+        Object[] entry;
+        while ((entry = retiredSegments.peek()) != null) {
+            long retiredAt = (long) entry[0];
+            if (now - retiredAt < graceNanos) {
+                break; // Not yet safe to free
+            }
+            retiredSegments.poll();
+            NativeMemory.free((MemorySegment) entry[1]);
         }
     }
 
@@ -484,7 +486,7 @@ public class OffHeapHashTable implements AutoCloseable {
             StampedLock lock = tableLocks[i];
             long stamp = lock.writeLock();
             try {
-                cleanupQueue.offer(tableSegments[i]);
+                retiredSegments.offer(new Object[] { System.nanoTime(), tableSegments[i] });
                 int cap = tableCapacities[i];
                 MemorySegment seg = NativeMemory.calloc(cap, SLOT_SIZE);
                 tableSegments[i] = seg;

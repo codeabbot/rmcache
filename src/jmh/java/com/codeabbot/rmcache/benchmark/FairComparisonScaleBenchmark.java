@@ -14,7 +14,7 @@ import com.target.nativememoryallocator.map.NativeMemoryMap;
 import com.target.nativememoryallocator.map.NativeMemoryMapBackend;
 import com.target.nativememoryallocator.map.NativeMemoryMapBuilder;
 import com.target.nativememoryallocator.map.NativeMemoryMapSerializer;
-import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+
 import org.openjdk.jmh.annotations.*;
 
 import java.util.concurrent.ThreadLocalRandom;
@@ -64,7 +64,6 @@ public class FairComparisonScaleBenchmark {
                 .hashTableLoadFactor(0.5d)
                 .ghostCacheMode(GhostCacheMode.DISABLED)
                 .ghostCacheSize(0)
-                .withMeterRegistry(new SimpleMeterRegistry())
                 .withCacheName("benchmark")
                 .build();
 

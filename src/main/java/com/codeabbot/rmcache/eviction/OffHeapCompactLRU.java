@@ -8,6 +8,12 @@ import java.lang.foreign.ValueLayout;
  * Off-Heap implementation of CompactLRU (SLRU policy).
  * Stores next/prev pointers in native memory, with segment flags packed
  * into the top 2 bits of the next pointer (saves 1 byte per entry).
+ *
+ * <p>
+ * <b>Thread-Safety:</b> This class is NOT thread-safe. All operations must
+ * be externally synchronized by the caller (e.g., via {@code shardLocks[shard]}
+ * in {@link LRUPolicy}). Callers MUST hold the shard lock before calling any
+ * method on this class.
  * 
  * @author Rabindra Meher
  */
@@ -41,6 +47,14 @@ public class OffHeapCompactLRU implements AutoCloseable {
     int protectedSize = 0;
 
     public OffHeapCompactLRU(int capacity) {
+        // C2 fix: Prevent slot IDs from exceeding 30-bit NEXT_MASK.
+        // At capacity > 0x3FFFFFFF, slot values would alias with the
+        // segment flags packed in the top 2 bits of the next pointer.
+        if (capacity > NEXT_MASK) {
+            throw new IllegalArgumentException(
+                    "OffHeapCompactLRU capacity " + capacity + " exceeds maximum " + NEXT_MASK
+                            + " (30-bit limit). Reduce maxEntries or increase shard count.");
+        }
         this.capacity = capacity;
         long size = capacity + 1;
         this.next = NativeMemory.calloc(size, ValueLayout.JAVA_INT.byteSize());

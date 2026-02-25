@@ -23,7 +23,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
-import java.util.Collections;
+
+import java.util.Objects;
 import java.util.Set;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
@@ -49,7 +50,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
      * Shaves off redundant ThreadLocal.get() calls.
      */
     static class CacheContext {
-        byte[] valueBuffer = new byte[256 * 1024];
+        private static final int INITIAL_BUFFER_SIZE = 4 * 1024; // 4KB initial, grows lazily
+        private static final int MAX_BUFFER_SIZE = 256 * 1024; // 256KB max
+        byte[] valueBuffer = new byte[INITIAL_BUFFER_SIZE];
+
+        byte[] ensureCapacity(int needed) {
+            if (needed > valueBuffer.length) {
+                int newSize = Math.min(Math.max(valueBuffer.length * 2, needed), MAX_BUFFER_SIZE);
+                if (needed > MAX_BUFFER_SIZE) {
+                    return new byte[needed]; // One-off allocation for oversized values
+                }
+                valueBuffer = new byte[newSize];
+            }
+            return valueBuffer;
+        }
     }
 
     private final KeySerializer<K> keySerializer;
@@ -115,6 +129,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init start");
         }
+        // H6 fix: Register with CoarseClock so the clock thread starts/stops
+        // automatically with cache lifecycle.
+        CoarseClock.acquire();
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
         this.allocator = allocator;
@@ -241,6 +258,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     @Override
     public void put(K key, V value, Duration ttl, short priority) {
+        // M1 fix: Fail fast on null key/value instead of NPE deep in serializer.
+        Objects.requireNonNull(key, "key must not be null");
+        Objects.requireNonNull(value, "value must not be null");
         if (closed)
             throw new IllegalStateException("Closed");
 
@@ -248,37 +268,53 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     }
 
     private void putInternal(K key, V value, Duration ttl, short priority) {
+        putInternal(key, value, ttl, priority, false);
+    }
+
+    private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
 
-        byte[] keyBytes;
-        int keyLen;
-        if (isLatin1Key && key instanceof String s) {
-            ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-            keyBytes = res.buffer();
-            keyLen = res.length();
-        } else {
-            keyBytes = keySerializer.serialize(key);
-            keyLen = keyBytes.length;
+        CacheContext ctx = context.get();
+
+        int existingSlot = 0;
+        if (hasOffHeapGhostCache) {
+            existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+        }
+        byte[] keyBytes = null;
+        int keyLen = 0;
+        if (existingSlot == 0) {
+            if (useKeyMatchFastPath) {
+                existingSlot = hashTable.getWithKey(keyHash, key, keySerializer);
+            } else {
+                if (isLatin1Key && key instanceof String s) {
+                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                    keyLen = res.length();
+                    keyBytes = Arrays.copyOf(res.buffer(), keyLen); // Defensive copy — buffer is reused
+                } else {
+                    keyBytes = keySerializer.serialize(key);
+                    keyLen = keyBytes.length;
+                }
+                existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+            }
         }
 
-        // O5: Use cached serializer types instead of per-call instanceof
         SegmentValueSerializer<V> segSer = this.cachedSegSer;
         StreamingSerializer<V> streamSer = this.cachedStreamSer;
         int valueMaxLen = 0;
         byte[] valueBytes = null;
         int valueLen = 0;
 
-        CacheContext ctx = context.get();
         if (segSer != null) {
             valueMaxLen = Math.max(0, segSer.estimateSize(value));
         } else if (streamSer != null) {
             int estimate = Math.max(0, streamSer.estimateSize(value));
-            byte[] buf = ctx.valueBuffer;
-            if (estimate > buf.length) {
-                buf = new byte[estimate];
-                ctx.valueBuffer = buf;
-            }
+            byte[] buf = ctx.ensureCapacity(estimate);
             valueLen = streamSer.serializeTo(value, buf, 0);
+            if (valueLen > buf.length) {
+                // estimateSize undershot — re-allocate and re-serialize
+                buf = ctx.ensureCapacity(valueLen);
+                valueLen = streamSer.serializeTo(value, buf, 0);
+            }
             valueBytes = buf;
         } else if (isByteArrayValue && value instanceof byte[] b) {
             valueLen = b.length;
@@ -290,26 +326,35 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         long expiresAtMillis = (ttl != null) ? CoarseClock.getNow() + ttl.toMillis() : 0L;
 
-        // O1: Use cached boolean instead of null check
-        int existingSlot = 0;
-        if (hasOffHeapGhostCache) {
-            existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-        }
-        if (existingSlot == 0) {
-            existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
-        }
-
         if (existingSlot != 0) {
+            // Respect putIfAbsent concurrency
+            if (putIfAbsent)
+                return false;
+
             boolean updated = (segSer != null)
                     ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value)
                     : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen);
 
             if (updated) {
                 evictionPolicy.onAccess(existingSlot, keyHash);
-                // O6: Skip ghost cache bookkeeping on updates — slot already tracked
-                return;
+                // Skip ghost cache bookkeeping on updates — slot already tracked
+                return true;
             }
+        }
 
+        // Delay serialization until allocation is needed
+        if (keyBytes == null) {
+            if (isLatin1Key && key instanceof String s) {
+                ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                keyLen = res.length();
+                keyBytes = Arrays.copyOf(res.buffer(), keyLen);
+            } else {
+                keyBytes = keySerializer.serialize(key);
+                keyLen = keyBytes.length;
+            }
+        }
+
+        if (existingSlot != 0) {
             int newSlot = (segSer != null)
                     ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value, priority,
                             expiresAtMillis)
@@ -324,14 +369,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (newSlot == 0)
-                    return;
+                    return false;
             }
 
-            int oldSlotInTable = hashTable.putWithLen(keyHash, keyBytes, keyLen, newSlot);
+            int oldSlotInTable = hashTable.putEntry(keyHash, keyBytes, keyLen, newSlot, false);
             if (oldSlotInTable == -1) {
                 entryPool.free(newSlot);
-                return;
+                return false; // K7: probe limit exceeded — insertion failed
             } else if (oldSlotInTable != 0) {
+                evictionPolicy.onRemove(oldSlotInTable);
                 entryPool.free(oldSlotInTable);
                 evictionPolicy.onAccess(newSlot, keyHash);
             } else {
@@ -342,7 +388,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
             if (hasOffHeapGhostCache)
                 offHeapGhostCache.put(keyHash, newSlot);
-            return;
+            return true;
         }
 
         if (evictionPolicy.shouldEvict()) {
@@ -367,13 +413,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                     : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                             expiresAtMillis);
             if (slot == 0)
-                return;
+                return false;
         }
 
         try {
-            int oldSlot = hashTable.putWithLen(keyHash, keyBytes, keyLen, slot);
+            int oldSlot = hashTable.putEntry(keyHash, keyBytes, keyLen, slot, putIfAbsent);
             if (oldSlot == -1) {
                 entryPool.free(slot);
+                if (putIfAbsent)
+                    return false;
+
                 evictIfNeeded(true);
                 int retrySlot = (segSer != null)
                         ? entryPool.allocateWithSerializer(keyHash, keyBytes, keyLen, valueMaxLen, segSer, value,
@@ -381,28 +430,42 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (retrySlot == 0) {
-                    return;
+                    return false;
                 }
-                int retryOld = hashTable.putWithLen(keyHash, keyBytes, keyLen, retrySlot);
+                int retryOld = hashTable.putEntry(keyHash, keyBytes, keyLen, retrySlot, putIfAbsent);
                 if (retryOld == -1) {
                     entryPool.free(retrySlot);
-                    return;
+                    return false;
                 } else if (retryOld != 0) {
-                    entryPool.free(retrySlot);
-                    evictionPolicy.onAccess(retryOld, keyHash);
-                    if (hasOffHeapGhostCache)
-                        offHeapGhostCache.put(keyHash, retryOld);
+                    if (putIfAbsent) {
+                        entryPool.free(retrySlot);
+                        return false;
+                    } else {
+                        evictionPolicy.onRemove(retryOld);
+                        entryPool.free(retryOld);
+                        evictionPolicy.onAccess(retrySlot, keyHash);
+                        if (hasOffHeapGhostCache)
+                            offHeapGhostCache.put(keyHash, retrySlot);
+                    }
                 } else {
                     evictionPolicy.onAdd(retrySlot, keyHash, priority);
                     if (hasOffHeapGhostCache)
                         offHeapGhostCache.put(keyHash, retrySlot);
                 }
-                return;
+                if (hasGhostCache)
+                    ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
+                return true;
             } else if (oldSlot != 0) {
-                entryPool.free(slot); // Race: someone else added it
-                evictionPolicy.onAccess(oldSlot, keyHash);
-                if (hasOffHeapGhostCache)
-                    offHeapGhostCache.put(keyHash, oldSlot);
+                if (putIfAbsent) {
+                    entryPool.free(slot); // Race: someone else added it
+                    return false;
+                } else {
+                    evictionPolicy.onRemove(oldSlot);
+                    entryPool.free(oldSlot);
+                    evictionPolicy.onAccess(slot, keyHash);
+                    if (hasOffHeapGhostCache)
+                        offHeapGhostCache.put(keyHash, slot);
+                }
             } else {
                 evictionPolicy.onAdd(slot, keyHash, priority);
                 if (hasOffHeapGhostCache)
@@ -415,10 +478,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
+        return true;
     }
 
     @Override
     public V get(K key) {
+        Objects.requireNonNull(key, "key must not be null");
         if (closed)
             return null;
 
@@ -433,24 +498,57 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
         }
 
-        int slot = 0;
-        if (hasOffHeapGhostCache) {
-            slot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-        }
-
         byte[] keyBytes = null;
         int keyLen = 0;
+        int slot = 0;
+        if (hasOffHeapGhostCache) {
+            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            // Re-validate ghost cache hit through hash table to prevent stale slot
+            // references
+            if (ghostSlot != 0) {
+                int confirmedSlot;
+                if (useKeyMatchFastPath) {
+                    confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
+                } else {
+                    if (isLatin1Key && key instanceof String s) {
+                        // M7 warning: ThreadLocalKeyBuffer is a SHARED buffer. This is safe
+                        // as long as this get() path has no callbacks or re-entrancy points.
+                        // Adding eviction listeners, cache loaders, or nested cache calls
+                        // here would corrupt the buffer. If re-entrancy is ever needed,
+                        // copy keyBytes before any callback: keyBytes = Arrays.copyOf(res.buffer(),
+                        // res.length()).
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
+                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+                }
+                if (confirmedSlot == ghostSlot) {
+                    slot = ghostSlot;
+                } else {
+                    // Ghost cache was stale — invalidate and use hash table result
+                    offHeapGhostCache.invalidate(keyHash);
+                    slot = confirmedSlot;
+                }
+            }
+        }
+
         if (slot == 0) {
             if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                if (isLatin1Key && key instanceof String s) {
-                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                    keyBytes = res.buffer();
-                    keyLen = res.length();
-                } else {
-                    keyBytes = keySerializer.serialize(key);
-                    keyLen = keyBytes.length;
+                if (keyBytes == null) {
+                    if (isLatin1Key && key instanceof String s) {
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
                 }
                 slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
@@ -486,13 +584,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     }
 
     private V readValueFromSlot(int slot, CacheContext ctx) {
+        // C3 fix: Guard against slot freed between lookup and read
+        if (entryPool.getOffset(slot) == -1L)
+            return null;
         if (isByteArrayValue) {
             int valLen = entryPool.getValueLen(slot);
-            byte[] vBuf = ctx.valueBuffer;
-            if (valLen > vBuf.length) {
-                vBuf = new byte[valLen];
-                ctx.valueBuffer = vBuf;
-            }
+            byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
             @SuppressWarnings("unchecked")
             V res = (V) Arrays.copyOf(vBuf, valLen);
@@ -501,11 +598,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         if (cachedStreamSer != null) {
             int valLen = entryPool.getValueLen(slot);
-            byte[] vBuf = ctx.valueBuffer;
-            if (valLen > vBuf.length) {
-                vBuf = new byte[valLen];
-                ctx.valueBuffer = vBuf;
-            }
+            byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
             return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
@@ -516,21 +609,35 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     @Override
     public boolean remove(K key) {
+        Objects.requireNonNull(key, "key must not be null");
         checkNotClosed();
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
-        byte[] keyBytes;
-        int keyLen;
-        if (isLatin1Key && key instanceof String s) {
-            ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-            keyBytes = res.buffer();
-            keyLen = res.length();
+        byte[] keyBytes = null;
+        int keyLen = 0;
+        int slot;
+
+        if (useKeyMatchFastPath) {
+            slot = hashTable.getWithKey(keyHash, key, keySerializer);
         } else {
-            keyBytes = keySerializer.serialize(key);
-            keyLen = keyBytes.length;
+            if (isLatin1Key && key instanceof String s) {
+                ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                keyLen = res.length();
+                keyBytes = Arrays.copyOf(res.buffer(), keyLen); // Defensive copy — buffer is reused
+            } else {
+                keyBytes = keySerializer.serialize(key);
+                keyLen = keyBytes.length;
+            }
+            slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
         }
-        int slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+
         if (slot == 0)
             return false;
+
+        if (keyBytes == null) {
+            keyBytes = entryPool.readKey(slot);
+            keyLen = (keyBytes != null) ? keyBytes.length : 0;
+        }
+
         removeInternal(keyHash, keyBytes, keyLen, slot, EvictionCause.EXPLICIT);
         return true;
     }
@@ -543,28 +650,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public boolean putIfAbsent(K key, V value, Duration ttl) {
         checkNotClosed();
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
-        byte[] keyBytes;
-        int keyLen;
-        if (isLatin1Key && key instanceof String s) {
-            ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-            keyBytes = res.buffer();
-            keyLen = res.length();
-        } else {
-            keyBytes = keySerializer.serialize(key);
-            keyLen = keyBytes.length;
-        }
-
-        // Check if key already exists
-        int existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
-        if (existingSlot != 0) {
-            // Key exists, don't overwrite
-            return false;
-        }
-
-        // Key doesn't exist, perform put
-        put(key, value, ttl, (short) 0);
-        return true;
+        return putInternal(key, value, ttl, (short) 0, true);
     }
 
     @Override
@@ -574,6 +660,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     @Override
     public V computeIfAbsent(K key, java.util.function.Function<K, V> loader, Duration ttl) {
+        // NOTE: This is NOT atomic. The sequence get() → loader.apply() → putIfAbsent()
+        // has a TOCTOU window where another thread can insert the same key between
+        // the get() miss and the putIfAbsent(). In that case, the loader is invoked
+        // but its result is discarded. For expensive loaders (DB, RPC), consider
+        // external synchronization (e.g., Striped<Lock>) if duplicate computation
+        // is unacceptable.
         checkNotClosed();
 
         // First attempt to get existing value
@@ -588,8 +680,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return null;
         }
 
-        // Try to insert (race condition possible, but acceptable)
-        put(key, computed, ttl, (short) 0);
+        // Try to insert (avoids overwrite race conditions)
+        boolean inserted = putInternal(key, computed, ttl, (short) 0, true);
+        if (!inserted) {
+            // Race lost, retrieve the newly updated value
+            return get(key);
+        }
         return computed;
     }
 
@@ -641,7 +737,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     @Override
     public Set<K> getKeys() {
-        return Collections.emptySet();
+        throw new UnsupportedOperationException(
+                "getKeys() is not supported by OffHeapCacheImpl. " +
+                        "Off-heap entries cannot be iterated without full key deserialization.");
     }
 
     @Override
@@ -650,6 +748,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             ghostCache.invalidateAll();
         if (offHeapGhostCache != null)
             offHeapGhostCache.clear();
+        // C4 fix: Free all allocated entry blocks before clearing the hash table.
+        // Without this, slab memory is leaked until close().
+        int total = entryPool.slotCapacity();
+        for (int slot = 1; slot < total; slot++) {
+            if (entryPool.getOffset(slot) != -1L) {
+                evictionPolicy.onRemove(slot);
+                entryPool.free(slot);
+            }
+        }
         hashTable.clear();
     }
 
@@ -674,21 +781,23 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int removedSlot = hashTable.remove(keyHash, lookupKey);
 
         if (removedSlot != 0) {
-            if (evictionListener != null) {
-                // Serialization of key for event?
-                K key = keySerializer.deserialize(keyBytes);
-                // Supplier is simple.
-                java.util.function.Supplier<V> valueLazy = () -> {
+            try {
+                if (evictionListener != null) {
+                    K key = keySerializer.deserialize(keyBytes);
+                    // Read value EAGERLY before free — prevents use-after-free
+                    // if the listener stores the supplier for deferred access
                     byte[] vBytes = entryPool.readValue(removedSlot);
-                    return valueSerializer.deserialize(vBytes);
-                };
-                evictionListener.onEviction(key, valueLazy, cause);
-            }
-            evictionPolicy.onRemove(removedSlot);
-            entryPool.free(removedSlot);
+                    java.util.function.Supplier<V> valueLazy = () -> valueSerializer.deserialize(vBytes);
+                    evictionListener.onEviction(key, valueLazy, cause);
+                }
+            } finally {
+                // Always clean up — even if listener throws
+                evictionPolicy.onRemove(removedSlot);
+                entryPool.free(removedSlot);
 
-            if (cause != EvictionCause.EXPLICIT)
-                globalEvictions.increment();
+                if (cause != EvictionCause.EXPLICIT)
+                    globalEvictions.increment();
+            }
         }
     }
 
@@ -698,8 +807,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     private void evictIfNeeded(boolean force) {
         int attempts = 0;
+        int filterRejects = 0; // Track consecutive filter rejections to avoid spin loops
         boolean forceOnce = force;
-        while (attempts < 100) {
+        int totalAttempts = 0; // H6 fix: hard cap to prevent unbounded blocking
+        while (attempts < 100 && totalAttempts < 1000) {
+            totalAttempts++;
             if (!forceOnce && !evictionPolicy.shouldEvict() && !isMemoryAboveLow()) {
                 break;
             }
@@ -747,19 +859,36 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
                 if (!evictionFilter.canEvict(key, meta)) {
                     evictionPolicy.onAdd(slot, keyHash, meta.getPriority());
+                    filterRejects++;
                     attempts++;
+                    // Avoid infinite re-admission loop: if the same slots keep getting rejected,
+                    // break out after a small number of consecutive rejections
+                    if (filterRejects >= 3) {
+                        break;
+                    }
                     continue;
                 }
             }
 
+            filterRejects = 0; // Reset on successful eviction
             removeInternal(keyHash, keyBytes, keyBytes.length, slot, EvictionCause.SIZE);
             attempts = 0;
             forceOnce = false;
         }
     }
 
+    /**
+     * C3 warning: The MemorySegment passed to the processor points to LIVE off-heap
+     * memory. If another thread evicts or updates (realloc) the same entry while
+     * the
+     * processor is executing, the segment may point to freed or reallocated memory
+     * (use-after-free). Callers must ensure external synchronization or accept the
+     * risk of reading stale/corrupt data during concurrent eviction.
+     */
     @Override
     public <T> T getZeroCopy(K key, java.util.function.Function<MemorySegment, T> processor) {
+        Objects.requireNonNull(key, "key must not be null");
+        Objects.requireNonNull(processor, "processor must not be null");
         if (closed)
             return null;
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
@@ -807,8 +936,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return processor.apply(segment);
     }
 
+    /**
+     * M5 warning: The returned CacheValueView holds a raw slot reference and value
+     * offset. If the entry is evicted, removed, or reallocated (value resize) after
+     * this method returns, the view will read freed/stale off-heap memory. Callers
+     * must consume the view immediately and not store it beyond the current scope.
+     */
     @Override
     public CacheValueView getView(K key) {
+        Objects.requireNonNull(key, "key must not be null");
         if (closed)
             return null;
         int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
@@ -868,18 +1004,26 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public void close() {
         closed = true;
+        // Shut down executors FIRST and wait for completion before freeing native
+        // memory
         if (evictionExecutor != null) {
             evictionExecutor.shutdown();
             try {
-                evictionExecutor.awaitTermination(200, TimeUnit.MILLISECONDS);
+                if (!evictionExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                    evictionExecutor.shutdownNow();
+                }
             } catch (InterruptedException e) {
+                evictionExecutor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
         }
         maintenanceExecutor.shutdown();
         try {
-            maintenanceExecutor.awaitTermination(200, TimeUnit.MILLISECONDS);
+            if (!maintenanceExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+                maintenanceExecutor.shutdownNow();
+            }
         } catch (InterruptedException e) {
+            maintenanceExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
         entryPool.close();
@@ -891,5 +1035,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (evictionPolicy != null) {
             evictionPolicy.close();
         }
+        // H6 fix: Release CoarseClock reference — stops clock thread
+        // when the last cache instance is closed.
+        CoarseClock.release();
     }
 }

@@ -21,8 +21,20 @@ public final class ThreadLocalKeyBuffer {
      * Encode a String key to bytes without allocation.
      * 
      * @return BufferResult containing the (reused) buffer and actual length.
+     * @deprecated Use {@link #encodeStringFast(String)} + {@link #getBuffer()} for
+     *             zero-allocation.
      */
     public static BufferResult encodeString(String key) {
+        int len = encodeStringFast(key);
+        return new BufferResult(bufferHolder.get(), len);
+    }
+
+    /**
+     * Zero-allocation string encoding. Returns the encoded length.
+     * Caller must use {@link #getBuffer()} to access the encoded bytes.
+     * The buffer is thread-local and reused across calls.
+     */
+    public static int encodeStringFast(String key) {
         int len = key.length();
         byte[] buffer = bufferHolder.get();
 
@@ -35,7 +47,7 @@ public final class ThreadLocalKeyBuffer {
             buffer[i] = (byte) key.charAt(i);
         }
 
-        return new BufferResult(buffer, len);
+        return len;
     }
 
     public static byte[] getBuffer() {

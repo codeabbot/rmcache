@@ -1,5 +1,6 @@
 package com.codeabbot.rmcache.eviction;
 
+import com.codeabbot.rmcache.util.CoarseClock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -32,11 +33,11 @@ class TimingWheel {
 
     public boolean hasExpired() {
         Entry head = queue.peek();
-        return head != null && System.currentTimeMillis() >= head.expiresAtMs;
+        return head != null && CoarseClock.getNow() >= head.expiresAtMs;
     }
 
     public List<Integer> pollExpired(int maxCount) {
-        long now = System.currentTimeMillis();
+        long now = CoarseClock.getNow();
         List<Integer> result = new ArrayList<>();
         while (result.size() < maxCount) {
             Entry entry = queue.peek();

@@ -18,7 +18,15 @@ public interface CacheValueView extends AutoCloseable {
     /** Size of the value in bytes. */
     int size();
 
-    /** Direct read-only access to the off-heap memory segment. */
+    /**
+     * Direct read-only access to the off-heap memory segment.
+     *
+     * <p>
+     * <b>WARNING: UNSAFE.</b> The returned segment points directly into off-heap
+     * memory that may be freed if the entry is evicted or the cache is closed.
+     * Do NOT hold this reference beyond the immediate scope of your read.
+     * Accessing a freed segment causes a JVM crash (SIGSEGV).
+     */
     MemorySegment segment();
 
     /** Copy the value to a byte array. */

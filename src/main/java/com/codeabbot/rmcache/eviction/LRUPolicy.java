@@ -154,19 +154,26 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
     @Override
     public void onRemove(int slot) {
         int shard = shardFor(slot);
+        boolean removed;
         shardLocks[shard].lock();
         try {
-            if (shards[shard].remove(slot)) {
-                _size.decrementAndGet();
-            }
+            // H3 fix: only decrement _size if the slot was actually in an LRU list.
+            // selectVictim() calls poll*() which clears the segment to NONE,
+            // so if onRemove is called after selectVictim, remove() returns false
+            // and we skip the decrement. For direct removes (not via eviction),
+            // the segment is still set, so remove() returns true and we decrement.
+            removed = shards[shard].remove(slot);
         } finally {
             shardLocks[shard].unlock();
+        }
+        if (removed) {
+            _size.decrementAndGet();
         }
     }
 
     @Override
     public int selectVictim() {
-        // Round-robin across shards to find a victim
+        // Round-robin across shards to find a victim.
         int startShard = victimShardCounter.getAndIncrement() & shardMask;
         for (int i = 0; i < shardCount; i++) {
             int shard = (startShard + i) & shardMask;
@@ -174,6 +181,8 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
             try {
                 if (shards[shard].probationSize > 0) {
                     int victim = shards[shard].pollProbation();
+                    // H3 fix: decrement here since poll already removed from list;
+                    // onRemove will see segment=NONE and skip double-decrement.
                     _size.decrementAndGet();
                     return victim;
                 }

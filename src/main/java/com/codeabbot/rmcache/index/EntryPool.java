@@ -163,16 +163,18 @@ public class EntryPool implements AutoCloseable {
      * For a 16-byte key, this does 2 reads instead of 16.
      */
     private static boolean compareKeyBytes(long keyStart, byte[] keyBytes, int keyLen) {
-        MemorySegment keySegment = MemorySegment.ofArray(keyBytes);
         int i = 0;
-        // Compare 8 bytes at a time
-        for (; i + 8 <= keyLen; i += 8) {
-            long offHeapWord = NativeMemory.UNLIMITED.get(UNALIGNED_LONG, keyStart + i);
-            long onHeapWord = keySegment.get(UNALIGNED_LONG, i);
-            if (offHeapWord != onHeapWord)
-                return false;
+        // Compare 8 bytes at a time using long-word reads
+        if (keyLen >= 8) {
+            MemorySegment keySegment = MemorySegment.ofArray(keyBytes);
+            for (; i + 8 <= keyLen; i += 8) {
+                long offHeapWord = NativeMemory.UNLIMITED.get(UNALIGNED_LONG, keyStart + i);
+                long onHeapWord = keySegment.get(UNALIGNED_LONG, i);
+                if (offHeapWord != onHeapWord)
+                    return false;
+            }
         }
-        // Compare remaining bytes (0-7 tail bytes)
+        // Compare remaining bytes (0-7 tail bytes) — no segment wrapper needed
         for (; i < keyLen; i++) {
             if (NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, keyStart + i) != keyBytes[i])
                 return false;
@@ -198,6 +200,11 @@ public class EntryPool implements AutoCloseable {
         long offset = getOffset(slot);
         if (offset == -1L)
             return false;
+        return matchesAt(offset, key, serializer);
+    }
+
+    @SuppressWarnings("unchecked")
+    public boolean matchesAt(long offset, Object key, KeySerializer serializer) {
         int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
         long relOffset = offset - baseAddr;
         return serializer.matches(key, baseSegment, relOffset + 24, keyLen);
@@ -218,6 +225,17 @@ public class EntryPool implements AutoCloseable {
         return (offset != -1L) ? NativeMemory.UNLIMITED.get(UNALIGNED_LONG, offset + 4) : 0L;
     }
 
+    /**
+     * Clear the expiration time for a slot (set to 0 = no TTL).
+     * Used by OffHeapTimingWheel for O(1) lazy cancellation.
+     */
+    public void clearExpiresAt(int slot) {
+        long offset = getOffset(slot);
+        if (offset != -1L) {
+            NativeMemory.UNLIMITED.set(UNALIGNED_LONG, offset + 4, 0L);
+        }
+    }
+
     public boolean isExpired(int slot) {
         long e = getExpiresAt(slot);
         return e > 0 && CoarseClock.getNow() >= e;
@@ -231,6 +249,13 @@ public class EntryPool implements AutoCloseable {
         byte[] bytes = new byte[keyLen];
         MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, offset + 24, bytes, 0, keyLen);
         return bytes;
+    }
+
+    public int getKeyLen(int slot) {
+        long offset = getOffset(slot);
+        if (offset == -1L)
+            return 0;
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
     }
 
     public byte[] readValue(int slot) {
@@ -464,62 +489,50 @@ public class EntryPool implements AutoCloseable {
                 int sc = unpackSC(packed);
                 int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
 
+                // K2: Invalidate slot BEFORE freeing slab block — prevents concurrent
+                // get() from reading an offset that points to freed memory.
+                LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, -1L);
+
                 long relOffset = absOffset - baseAddr;
                 allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
 
-                LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, -1L);
-
                 while (true) {
                     int top = freeTop.get();
-                    freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
-                    if (freeTop.compareAndSet(top, top + 1))
+                    if (freeTop.compareAndSet(top, top + 1)) {
+                        freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
                         break;
+                    }
+                    Thread.onSpinWait(); // M4 fix: Reduce CPU contention on CAS retry
                 }
             }
         }
 
-        // O2: Lock-free fast path for in-place value update
+        // C1 fix: Always lock for in-place value update. The previous lock-free
+        // fast path allowed two concurrent threads to interleave value byte writes
+        // for the same slot, causing torn reads. The volatile offset re-check only
+        // caught reallocation races, not same-offset concurrent writes.
         public boolean updateValue(int slot, byte[] valueBytes, int valueLen) {
-            long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
-            if (packed == -1L)
-                return false;
-            long absOffset = unpackAddr(packed);
-            int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
-            int sc = unpackSC(packed);
-            int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
-            int newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
-
-            if (newSize <= cap) {
-                // Fast path: value fits — no lock needed, slot region is exclusive
-                long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
-                NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
-                MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
-                        valueLen);
-                return true;
-            }
-
-            // Slow path: reallocation needed — acquire lock
             lock.lock();
             try {
-                // Re-read under lock — offset may have changed
-                packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+                long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
                 if (packed == -1L)
                     return false;
-                absOffset = unpackAddr(packed);
-                keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
-                sc = unpackSC(packed);
-                cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
-                newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
+                long absOffset = unpackAddr(packed);
+                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+                int sc = unpackSC(packed);
+                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+                int newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
 
-                // Re-check: another thread may have reallocated to bigger capacity
                 if (newSize <= cap) {
+                    // K1: Write bytes FIRST, then length — prevents torn reads.
                     long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
-                    NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
                     MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
                             valueLen);
+                    NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
                     return true;
                 }
 
+                // Slow path: reallocation needed (already under lock)
                 int h = getKeyHash(slot);
                 byte[] k = readKey(slot);
                 short p = getPriority(slot);
