@@ -66,6 +66,14 @@ public class EntryPool implements AutoCloseable {
         }
         this.partitionShift = shift;
         long totalSlots = (long) numPartitions * (1L << shift);
+        // E2E-C1: Fail-fast guard — single-server mode caps at Integer.MAX_VALUE slots.
+        // At 2B entries × 256B avg = ~600GB RAM, which exceeds single-server capacity.
+        // Clustering phase will lift this limit with sharded slot spaces.
+        if (totalSlots > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException(
+                    "maxEntries too large for single-server mode: " + totalSlots
+                            + " slots > Integer.MAX_VALUE. Reduce maxEntries or partitions.");
+        }
         this.slotCapacity = (int) totalSlots;
 
         this.offsets = NativeMemory.malloc((totalSlots + 1) * 8L);
@@ -340,6 +348,21 @@ public class EntryPool implements AutoCloseable {
         return new long[] { vOffset + 4, vLen };
     }
 
+    /**
+     * E2E-E2: Allocation-free alternative to getValuePosition().
+     * Returns the absolute offset to the start of the value data for a slot,
+     * or -1L if the slot is freed. Use with getValueLen() to avoid
+     * allocating a long[] per getView() call.
+     */
+    public long getValueDataOffset(int slot) {
+        long offset = getOffset(slot);
+        if (offset == -1L)
+            return -1L;
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
+        return vOffset + 4;
+    }
+
     public void readValueToBuffer(int slot, byte[] buffer, int bufferOffset, int length) {
         long offset = getOffset(slot);
         if (offset == -1L)
@@ -402,6 +425,8 @@ public class EntryPool implements AutoCloseable {
                     int localIdx = freeSlots.getAtIndex(ValueLayout.JAVA_INT, (long) (top - 1));
                     int slot = (id << partitionShift) | localIdx;
                     if (slot == 0) {
+                        // E2E-C2 fix: Free the slab block to prevent native memory leak.
+                        allocator.freePacked(packedHandle);
                         freeTop.incrementAndGet();
                         return 0;
                     }
@@ -444,6 +469,8 @@ public class EntryPool implements AutoCloseable {
                     int localIdx = freeSlots.getAtIndex(ValueLayout.JAVA_INT, (long) (top - 1));
                     int slot = (id << partitionShift) | localIdx;
                     if (slot == 0) {
+                        // E2E-C2 fix: Free the slab block to prevent native memory leak.
+                        allocator.freePacked(packedHandle);
                         freeTop.incrementAndGet();
                         return 0;
                     }
@@ -493,6 +520,8 @@ public class EntryPool implements AutoCloseable {
                     int localIdx = freeSlots.getAtIndex(ValueLayout.JAVA_INT, (long) (top - 1));
                     int slot = (id << partitionShift) | localIdx;
                     if (slot == 0) {
+                        // E2E-C2 fix: Free the slab block to prevent native memory leak.
+                        allocator.freePacked(packedHandle);
                         freeTop.incrementAndGet();
                         return 0;
                     }

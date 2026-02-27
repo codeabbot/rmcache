@@ -854,17 +854,23 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 attempts++;
                 continue;
             }
-            K key = keySerializer.deserialize(keyBytes);
 
             if (evictionFilter != null) {
+                // E2E-H3: Only deserialize key when eviction filter is configured.
+                // Without a filter, this String allocation is wasted.
+                K key = keySerializer.deserialize(keyBytes);
                 meta.setSlot(slot);
 
                 if (!evictionFilter.canEvict(key, meta)) {
+                    // Re-admit victim back to LRU. We use onAdd() (not onAccess())
+                    // because selectVictim() destructively removes the slot from the
+                    // LRU linked list — onAccess() can only promote in-list slots.
+                    // Note: onAdd inserts to WINDOW segment. Under aggressive filters
+                    // this may shift the SLRU balance. Acceptable for single-server;
+                    // clustering phase can add a reAdmitToProbation() method.
                     evictionPolicy.onAdd(slot, keyHash, meta.getPriority());
                     filterRejects++;
                     attempts++;
-                    // Avoid infinite re-admission loop: if the same slots keep getting rejected,
-                    // break out after a small number of consecutive rejections
                     if (filterRejects >= 3) {
                         break;
                     }
@@ -872,7 +878,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 }
             }
 
-            filterRejects = 0; // Reset on successful eviction
+            filterRejects = 0;
             removeInternal(keyHash, keyBytes, keyBytes.length, slot, EvictionCause.SIZE);
             attempts = 0;
             forceOnce = false;
@@ -1050,14 +1056,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return null;
         }
 
-        // P3-M1 fix: Use EntryPool API instead of manual offset math.
-        // Previously read NativeMemory directly with EntryBlockLayout constants,
-        // which would silently break if the entry layout ever changed.
-        long[] valPos = entryPool.getValuePosition(slot);
-        if (valPos == null)
+        // E2E-E2 fix: Use allocation-free getValueDataOffset() + getValueLen()
+        // instead of getValuePosition() which allocates new long[2] per call.
+        long valueOffset = entryPool.getValueDataOffset(slot);
+        if (valueOffset == -1L)
             return null;
-        long valueOffset = valPos[0];
-        int valueLen = (int) valPos[1];
+        int valueLen = entryPool.getValueLen(slot);
 
         evictionPolicy.onAccess(slot, keyHash);
         if (hasOffHeapGhostCache)
