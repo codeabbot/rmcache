@@ -210,17 +210,18 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public void drainBuffers() {
-        // O3 fix: Batch by shard — collect all slots per shard, then acquire
-        // each shard lock once instead of once per slot.
+        // P3-M2 fix: True shard-batching — partition slots into per-shard
+        // buckets, then lock each shard once per batch. Previous implementation
+        // locked per-slot (100 acquires/releases instead of ~4).
+        int[][] shardBuckets = new int[shardCount][];
+        int[] shardBucketSizes = new int[shardCount];
+
         for (int stripe = 0; stripe < numStripes; stripe++) {
             int count = Math.min(bufferIndices[stripe].getAndSet(0), bufferSize);
             if (count == 0)
                 continue;
 
-            // Pass 1: Partition into per-shard batches (reuse stripe buffer as temp)
-            // Since we process one stripe at a time, we can sort in-place.
-            // Simple approach: iterate and lock per-shard in contiguous runs.
-            // For most workloads, slots from the same stripe map to few shards.
+            // Pass 1: Partition into per-shard buckets
             int[] buf = buffers[stripe];
             for (int i = 0; i < count; i++) {
                 int slot = buf[i];
@@ -228,12 +229,26 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
                 if (slot == 0)
                     continue;
                 int shard = shardFor(slot);
-                shardLocks[shard].lock();
-                try {
-                    promote(slot, shard);
-                } finally {
-                    shardLocks[shard].unlock();
+                if (shardBuckets[shard] == null) {
+                    shardBuckets[shard] = new int[count]; // lazy alloc, count is upper bound
                 }
+                shardBuckets[shard][shardBucketSizes[shard]++] = slot;
+            }
+        }
+
+        // Pass 2: Process each shard batch under a single lock acquisition
+        for (int shard = 0; shard < shardCount; shard++) {
+            int batchSize = shardBucketSizes[shard];
+            if (batchSize == 0)
+                continue;
+            int[] batch = shardBuckets[shard];
+            shardLocks[shard].lock();
+            try {
+                for (int i = 0; i < batchSize; i++) {
+                    promote(batch[i], shard);
+                }
+            } finally {
+                shardLocks[shard].unlock();
             }
         }
 

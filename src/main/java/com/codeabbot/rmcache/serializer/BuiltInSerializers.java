@@ -64,17 +64,23 @@ public final class BuiltInSerializers {
                 }
                 return true;
             }
+            // P3-O1 fix: Manual byte loop instead of MemorySegment.ofArray()
+            // to avoid per-call allocation (same anti-pattern fixed by O2 in EntryPool).
             byte[] bytes = serialize(key);
             if (bytes.length != length)
                 return false;
-            return segment.asSlice(offset, (long) length).mismatch(MemorySegment.ofArray(bytes)) == -1L;
+            for (int i = 0; i < length; i++) {
+                if (segment.get(ValueLayout.JAVA_BYTE, offset + i) != bytes[i]) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
-    public static final StringKeySerializer STRING_KEY_UTF8 =
-            new StringKeySerializer(StandardCharsets.UTF_8, false);
-    public static final StringKeySerializer STRING_KEY_LATIN1 =
-            new StringKeySerializer(StandardCharsets.ISO_8859_1, true);
+    public static final StringKeySerializer STRING_KEY_UTF8 = new StringKeySerializer(StandardCharsets.UTF_8, false);
+    public static final StringKeySerializer STRING_KEY_LATIN1 = new StringKeySerializer(StandardCharsets.ISO_8859_1,
+            true);
 
     public static final KeySerializer<String> STRING_KEY = STRING_KEY_UTF8;
 

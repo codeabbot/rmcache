@@ -323,6 +323,23 @@ public class EntryPool implements AutoCloseable {
         return NativeMemory.UNLIMITED.asSlice(vOffset + 4, (long) vLen);
     }
 
+    /**
+     * P3-M1 fix: Return the absolute offset to the value data and its length
+     * for a given slot. Encapsulates layout pointer arithmetic so callers
+     * (like getView) don't need to know EntryBlockLayout internals.
+     *
+     * @return long[]{valueDataOffset, valueLen}, or null if slot is freed.
+     */
+    public long[] getValuePosition(int slot) {
+        long offset = getOffset(slot);
+        if (offset == -1L)
+            return null;
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 20);
+        long vOffset = offset + 20 + 4 + EntryBlockLayout.pad(keyLen);
+        int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
+        return new long[] { vOffset + 4, vLen };
+    }
+
     public void readValueToBuffer(int slot, byte[] buffer, int bufferOffset, int length) {
         long offset = getOffset(slot);
         if (offset == -1L)
@@ -517,7 +534,14 @@ public class EntryPool implements AutoCloseable {
 
                 // H1 fix: Use getAndIncrement instead of CAS loop to avoid
                 // spin-locking under extreme contention with 128+ threads.
+                // P3-C1 fix: Guard against overflow — if freeTop exceeds maxLocal
+                // (double-free or logic error), rollback to prevent writing beyond
+                // the native freeSlots segment boundary.
                 int top = freeTop.getAndIncrement();
+                if (top >= maxLocal) {
+                    freeTop.decrementAndGet(); // rollback — slot was already freed
+                    return;
+                }
                 freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
             }
         }

@@ -9,7 +9,7 @@ import com.codeabbot.rmcache.index.EntryPool;
 import com.codeabbot.rmcache.index.GhostCache;
 import com.codeabbot.rmcache.index.OffHeapGhostCache;
 import com.codeabbot.rmcache.index.OffHeapHashTable;
-import com.codeabbot.rmcache.memory.NativeMemory;
+
 import com.codeabbot.rmcache.memory.SlabAllocator;
 import com.codeabbot.rmcache.serializer.KeySerializer;
 import com.codeabbot.rmcache.serializer.SegmentValueSerializer;
@@ -1050,21 +1050,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return null;
         }
 
-        long offset = entryPool.getOffset(slot);
-        if (offset == -1L)
+        // P3-M1 fix: Use EntryPool API instead of manual offset math.
+        // Previously read NativeMemory directly with EntryBlockLayout constants,
+        // which would silently break if the entry layout ever changed.
+        long[] valPos = entryPool.getValuePosition(slot);
+        if (valPos == null)
             return null;
-
-        int storedKeyLen = NativeMemory.UNLIMITED.get(java.lang.foreign.ValueLayout.JAVA_INT,
-                offset + com.codeabbot.rmcache.index.EntryBlockLayout.HEADER_SIZE);
-        long valueOffset = offset + com.codeabbot.rmcache.index.EntryBlockLayout.HEADER_SIZE + 4
-                + com.codeabbot.rmcache.index.EntryBlockLayout.pad(storedKeyLen);
-        int valueLen = NativeMemory.UNLIMITED.get(java.lang.foreign.ValueLayout.JAVA_INT, valueOffset);
+        long valueOffset = valPos[0];
+        int valueLen = (int) valPos[1];
 
         evictionPolicy.onAccess(slot, keyHash);
         if (hasOffHeapGhostCache)
             offHeapGhostCache.put(keyHash, slot);
 
-        return new CacheValueViewImpl(entryPool, slot, valueOffset + 4, valueLen);
+        return new CacheValueViewImpl(entryPool, slot, valueOffset, valueLen);
     }
 
     @Override

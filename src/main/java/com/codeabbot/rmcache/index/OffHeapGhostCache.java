@@ -10,14 +10,19 @@ import java.lang.foreign.ValueLayout;
  * Direct-mapped, best-effort, zero-heap.
  *
  * <p>
+ * 
  * @implNote This cache uses <b>plain (non-volatile)</b> 64-bit reads and writes
- * for maximum throughput. Under concurrent access, a torn read may observe the
- * upper 32 bits (hash) from one entry and the lower 32 bits (slot) from
- * another.
- * This is safe because: (a) a hash mismatch causes a cache miss (L33-L41), and
- * (b) a slot mismatch is re-validated against the hash table (A2 fix in
- * OffHeapCacheImpl.get).
- * The worst case is a spurious miss, never corruption.
+ *           for maximum throughput. Under concurrent access, a torn read may
+ *           observe the
+ *           upper 32 bits (hash) from one entry and the lower 32 bits (slot)
+ *           from
+ *           another.
+ *           This is safe because: (a) a hash mismatch causes a cache miss
+ *           (L33-L41), and
+ *           (b) a slot mismatch is re-validated against the hash table (A2 fix
+ *           in
+ *           OffHeapCacheImpl.get).
+ *           The worst case is a spurious miss, never corruption.
  */
 public final class OffHeapGhostCache implements AutoCloseable {
     private static final int SLOT_SIZE = 8;
@@ -60,7 +65,10 @@ public final class OffHeapGhostCache implements AutoCloseable {
             return 0;
         }
 
-        if (!entryPool.matches(slot, key, serializer)) {
+        // P3-O2 fix: Use matchesAt(offset, ...) to skip the redundant
+        // getOffset(slot) call inside matches(). Saves one volatile read
+        // on the ghost cache hot path.
+        if (!entryPool.matchesAt(offset, key, serializer)) {
             return 0;
         }
 

@@ -110,7 +110,9 @@ public class TTLPolicy implements EvictionPolicy {
         if (wheel != null) {
             wheel.cancel(slot);
         }
-        _size.decrementAndGet();
+        // P3-C2 fix: Clamp to prevent negative _size when CompositePolicy
+        // calls onRemove for slots not tracked by this policy.
+        _size.updateAndGet(s -> Math.max(0, s - 1));
     }
 
     @Override
