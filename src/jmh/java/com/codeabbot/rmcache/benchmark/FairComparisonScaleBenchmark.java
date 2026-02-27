@@ -76,7 +76,7 @@ public class FairComparisonScaleBenchmark {
                 .eviction(new NoEvictionPolicy())
                 .hashTableLoadFactor(0.5d)
                 .ghostCacheMode(GhostCacheMode.OFF_HEAP)
-                .ghostCacheSize(8192)
+                .ghostCacheSize(entryCount * 2) // Size ghost cache to cover all entries
                 .build();
 
         // NMA allocator + Map (Using 8GB as requested to prevent breaking)

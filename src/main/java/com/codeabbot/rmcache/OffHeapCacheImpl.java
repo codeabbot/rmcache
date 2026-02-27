@@ -513,36 +513,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int slot = 0;
         if (hasOffHeapGhostCache) {
             int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-            // Re-validate ghost cache hit through hash table to prevent stale slot
-            // references
+            // Ghost cache's getSlot() already validates the slot via
+            // entryPool.matchesAt() — which confirms the slot is live and
+            // the key matches. No hash table re-validation needed.
+            // The only residual risk is a concurrent eviction between
+            // matchesAt (inside getSlot) and the value read below — but
+            // this is the same TOCTOU that exists in the normal GET path
+            // and is guarded by readValueFromSlot's offset check (C3 fix).
             if (ghostSlot != 0) {
-                int confirmedSlot;
-                if (useKeyMatchFastPath) {
-                    confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
-                } else {
-                    if (isLatin1Key && key instanceof String s) {
-                        // M7 warning: ThreadLocalKeyBuffer is a SHARED buffer. This is safe
-                        // as long as this get() path has no callbacks or re-entrancy points.
-                        // Adding eviction listeners, cache loaders, or nested cache calls
-                        // here would corrupt the buffer. If re-entrancy is ever needed,
-                        // copy keyBytes before any callback: keyBytes = Arrays.copyOf(res.buffer(),
-                        // res.length()).
-                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                        keyBytes = res.buffer();
-                        keyLen = res.length();
-                    } else {
-                        keyBytes = keySerializer.serialize(key);
-                        keyLen = keyBytes.length;
-                    }
-                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
-                }
-                if (confirmedSlot == ghostSlot) {
-                    slot = ghostSlot;
-                } else {
-                    // Ghost cache was stale — invalidate and use hash table result
-                    offHeapGhostCache.invalidate(keyHash);
-                    slot = confirmedSlot;
-                }
+                slot = ghostSlot;
             }
         }
 
