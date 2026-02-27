@@ -190,6 +190,8 @@ class BuddyAllocator {
         return false;
     }
 
+    // P4-O1 fix: Parameter changed from int to long for consistency
+    // with internal long arithmetic and future-proofing.
     private int calculateOrder(long size) {
         long s = size - 1;
         s |= s >>> 1;

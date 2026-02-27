@@ -42,6 +42,11 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
     private final AtomicInteger _size = new AtomicInteger(0);
     private Runnable maintenanceCallback;
 
+    // REG-1 fix: Pre-allocated shard batch arrays for drainBuffers().
+    // Reusable because drainBuffers is single-threaded (maintenance executor).
+    private final int[][] shardBatchSlots;
+    private final int[] shardBatchSizes;
+
     // Round-robin counter for victim selection across shards
     private final AtomicInteger victimShardCounter = new AtomicInteger(0);
 
@@ -84,6 +89,10 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         for (int i = 0; i < numStripes; i++) {
             bufferIndices[i] = new AtomicInteger(0);
         }
+
+        // REG-1: Pre-allocate shard batch arrays (reused across drain calls)
+        this.shardBatchSlots = new int[shardCount][bufferSize];
+        this.shardBatchSizes = new int[shardCount];
 
         executor.scheduleWithFixedDelay(this::drainBuffers, 10, 10, TimeUnit.MILLISECONDS);
     }
@@ -210,18 +219,20 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public void drainBuffers() {
-        // P3-M2 fix: True shard-batching — partition slots into per-shard
-        // buckets, then lock each shard once per batch. Previous implementation
-        // locked per-slot (100 acquires/releases instead of ~4).
-        int[][] shardBuckets = new int[shardCount][];
-        int[] shardBucketSizes = new int[shardCount];
+        // REG-1 + P3-M2: True shard-batching with pre-allocated arrays.
+        // Uses class fields instead of per-call allocation to eliminate GC pressure.
 
+        // Reset batch sizes
+        for (int s = 0; s < shardCount; s++) {
+            shardBatchSizes[s] = 0;
+        }
+
+        // Pass 1: Partition all stripe buffers into per-shard batches
         for (int stripe = 0; stripe < numStripes; stripe++) {
             int count = Math.min(bufferIndices[stripe].getAndSet(0), bufferSize);
             if (count == 0)
                 continue;
 
-            // Pass 1: Partition into per-shard buckets
             int[] buf = buffers[stripe];
             for (int i = 0; i < count; i++) {
                 int slot = buf[i];
@@ -229,23 +240,23 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
                 if (slot == 0)
                     continue;
                 int shard = shardFor(slot);
-                if (shardBuckets[shard] == null) {
-                    shardBuckets[shard] = new int[count]; // lazy alloc, count is upper bound
+                int idx = shardBatchSizes[shard];
+                if (idx < shardBatchSlots[shard].length) {
+                    shardBatchSlots[shard][idx] = slot;
+                    shardBatchSizes[shard] = idx + 1;
                 }
-                shardBuckets[shard][shardBucketSizes[shard]++] = slot;
             }
         }
 
         // Pass 2: Process each shard batch under a single lock acquisition
         for (int shard = 0; shard < shardCount; shard++) {
-            int batchSize = shardBucketSizes[shard];
+            int batchSize = shardBatchSizes[shard];
             if (batchSize == 0)
                 continue;
-            int[] batch = shardBuckets[shard];
             shardLocks[shard].lock();
             try {
                 for (int i = 0; i < batchSize; i++) {
-                    promote(batch[i], shard);
+                    promote(shardBatchSlots[shard][i], shard);
                 }
             } finally {
                 shardLocks[shard].unlock();

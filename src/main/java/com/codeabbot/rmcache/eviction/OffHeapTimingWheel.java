@@ -48,6 +48,11 @@ public final class OffHeapTimingWheel implements AutoCloseable {
 
     private final EntryPool entryPool;
 
+    // P4-M1 fix: Volatile hint for lock-free hasExpired().
+    // Updated on schedule() and pollExpiredOne(). Slightly stale is OK —
+    // false-negative just delays eviction by one maintenance cycle.
+    private volatile long earliestExpiry = Long.MAX_VALUE;
+
     // ── Constants ─────────────────────────────────────────────────────────────
 
     private static final int INT_BYTES = 4;
@@ -109,31 +114,24 @@ public final class OffHeapTimingWheel implements AutoCloseable {
             int pos = sizes[stripe]++;
             setSlot(stripe, pos, slot);
             siftUp(stripe, pos);
+            // P4-M1: Update earliest hint
+            long exp = entryPool.getExpiresAt(slot);
+            if (exp > 0 && exp < earliestExpiry) {
+                earliestExpiry = exp;
+            }
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * Returns {@code true} if any stripe has an expired entry at its head.
+     * P4-M1 fix: Lock-free check using volatile earliest hint.
+     * Slightly stale is acceptable — false-negative delays eviction
+     * by at most one maintenance cycle (10ms).
      */
     public boolean hasExpired() {
-        long now = CoarseClock.getNow();
-        for (int i = 0; i < numStripes; i++) {
-            ReentrantLock lock = locks[i];
-            lock.lock();
-            try {
-                if (sizes[i] > 0) {
-                    int head = getSlot(i, 0);
-                    long exp = entryPool.getExpiresAt(head);
-                    if (exp > 0 && now >= exp)
-                        return true;
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
-        return false;
+        long e = earliestExpiry;
+        return e > 0 && e != Long.MAX_VALUE && CoarseClock.getNow() >= e;
     }
 
     /**
@@ -158,6 +156,8 @@ public final class OffHeapTimingWheel implements AutoCloseable {
                     }
                     if (now >= exp) {
                         removeTop(i);
+                        // P4-M1: Refresh earliest hint after polling
+                        refreshEarliestExpiry();
                         return head;
                     }
                     break; // Head is not expired yet
@@ -167,6 +167,21 @@ public final class OffHeapTimingWheel implements AutoCloseable {
             }
         }
         return 0;
+    }
+
+    /** P4-M1: Scan all stripe heads to refresh the volatile hint. */
+    private void refreshEarliestExpiry() {
+        long min = Long.MAX_VALUE;
+        for (int i = 0; i < numStripes; i++) {
+            if (sizes[i] > 0) {
+                int head = getSlot(i, 0);
+                long exp = entryPool.getExpiresAt(head);
+                if (exp > 0 && exp < min) {
+                    min = exp;
+                }
+            }
+        }
+        earliestExpiry = min;
     }
 
     /**
