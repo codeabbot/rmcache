@@ -283,6 +283,17 @@ public class CacheBuilder<K, V> {
         try {
             allocator = new SlabAllocator(finalMemory, slabSize);
             entryPool = new EntryPool(allocator, maxEntries, partitions);
+
+            // S6 defense-in-depth: OffHeapCompactLRU packs segment flags into
+            // the top 2 bits of the 32-bit next pointer, leaving only 30 bits
+            // for slot IDs. Fail fast if slotCapacity exceeds this limit.
+            if (entryPool.slotCapacity() > 0x3FFFFFFF) {
+                throw new IllegalArgumentException(
+                        "slotCapacity " + entryPool.slotCapacity()
+                                + " exceeds OffHeapCompactLRU 30-bit limit (0x3FFFFFFF)."
+                                + " Reduce maxEntries or increase entryPoolPartitions.");
+            }
+
             hashTable = new OffHeapHashTable(entryPool, finalMemory, stripes, prefetch,
                     initialCapacity, loadFactor);
             policy = (evictionPolicy != null) ? evictionPolicy

@@ -28,7 +28,7 @@ cache.close();
 
 ## Requirements
 
-- **JDK 25+** (Java FFM API)
+- **JDK 22+** (Java FFM API, stable since JDK 22)
 - **Gradle 9.x** for building
 
 ## Building & Testing
@@ -58,9 +58,9 @@ cache.close();
 | `.keySerializer(KeySerializer<K>)` | — | — | Custom key serializer |
 | `.valueSerializer(ValueSerializer<V>)` | — | — | Custom value serializer |
 | `.eviction(EvictionPolicy)` | — | `NoEvictionPolicy` | Eviction policy (LRU, TTL, Composite) |
-| `.ghostCacheMode(GhostCacheMode)` | enum | `ON_HEAP` | Ghost cache strategy |
-| `.ghostCacheSize(int)` | int | `4096` | Ghost cache slot count |
-| `.hashTableLoadFactor(double)` | double | `0.75` | Hash table load factor |
+| `.ghostCacheMode(GhostCacheMode)` | enum | `AUTO` | Ghost cache strategy |
+| `.ghostCacheSize(int)` | int | auto | Ghost cache slot count |
+| `.hashTableLoadFactor(double)` | double | `0.60` | Hash table load factor |
 | `.hashTableStripes(int)` | int | auto | Number of hash table stripes (power of 2) |
 | `.entryPoolPartitions(int)` | int | `128` | Number of entry pool partitions (power of 2) |
 | `.enablePrefetch(boolean)` | boolean | `true` | Enable CPU cache prefetching |

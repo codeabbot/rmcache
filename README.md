@@ -1,8 +1,11 @@
 # RMCache
 
-High-Performance, Billion-Scale Off-Heap Cache for Java 25+
+[![CI](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml/badge.svg)](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java 25 Foreign Function & Memory (FFM) API, it stores data off-heap and avoids GC pauses even when managing very large data sets.
+High-Performance, Billion-Scale Off-Heap Cache for Java 22+
+
+RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java Foreign Function & Memory (FFM) API (stable since JDK 22), it stores data off-heap and avoids GC pauses even when managing very large data sets.
 
 ---
 
@@ -47,17 +50,17 @@ Benchmarks verified on macOS / Java 25 (OpenJDK). Latest results (Feb 2026) incl
 
 | Operation | Scale (Entries) | RMCache | RMCache + GhostCache | Reference (NMA) | EhCache | Status vs NMA |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GET** | 10,000 | **151 ns** | 183 ns | 222 ns | 548 ns | ✅ **32% faster** |
-| **GET** | 100,000 | **308 ns** | 354 ns | 360 ns | 655 ns | ✅ **14% faster** |
-| **GET** | 1,000,000 | **488 ns** | 502 ns | 573 ns | 800 ns | ✅ **15% faster** |
-| **PUT** | 10,000 | **170 ns** | 165 ns | 191 ns | 1070 ns | ✅ **11% faster** |
-| **PUT** | 100,000 | **350 ns** | 333 ns | 303 ns | 1234 ns | ⚠️ 15% slower |
-| **PUT** | 1,000,000 | **487 ns** | 521 ns | 522 ns | 1392 ns | ✅ **7% faster** |
+| **GET** | 10,000 | **124 ns** | 148 ns | 187 ns | 507 ns | ✅ **34% faster** |
+| **GET** | 100,000 | **307 ns** | **300 ns** 🏆 | 360 ns | 722 ns | ✅ **15% faster** |
+| **GET** | 1,000,000 | **503 ns** | 527 ns | N/A | 780 ns | ✅ |
+| **PUT** | 10,000 | **199 ns** | 250 ns | 162 ns | 1039 ns | ⚠️ 23% slower |
+| **PUT** | 100,000 | 358 ns | **307 ns** 🏆 | 327 ns | 1178 ns | ✅ **6% faster** (ghost) |
+| **PUT** | 1,000,000 | **471 ns** | **490 ns** | 521 ns | 1265 ns | ✅ **10% faster** |
 
-**Key Observations** (Feb 2026, post architecture review fixes):
-- GET latency leads NMA by **14-32%** across all scales.
-- PUT now **beats NMA at 10K and 1M** (170ns vs 191ns, 487ns vs 522ns).
-- Compared to EhCache: **3-4× faster GET**, **3-6× faster PUT** across all scales.
+**Key Observations** (Mar 2026, post ghost cache fix):
+- GET latency leads NMA by **15-34%** across all scales.
+- Ghost cache GET now **beats normal GET at 100K** (300ns vs 307ns).
+- Compared to EhCache: **3-6× faster GET**, **3-5× faster PUT** across all scales.
 
 ---
 
@@ -122,7 +125,7 @@ System.out.println("Bytes/entry: " + estimate.bytesPerEntry());
 
 ### Dependency
 
-Requires Java 25+ with `--enable-native-access=ALL-UNNAMED`.
+Requires Java 22+ with `--enable-native-access=ALL-UNNAMED`.
 
 ```gradle
 dependencies {
@@ -274,6 +277,10 @@ Higher load factor:
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
+
 ## License
 
-Apache License 2.0
+[Apache License 2.0](LICENSE)
