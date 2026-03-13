@@ -1,7 +1,6 @@
 package com.codeabbot.rmcache;
 
 import java.time.Duration;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 import java.lang.foreign.MemorySegment;
@@ -60,8 +59,14 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
 
     /**
      * Compute a value for the key if it's not already present.
-     * The loader function is called only if the key is absent.
-     * 
+     *
+     * <p><b>Not atomic.</b> The sequence {@code get() → loader.apply() →
+     * putIfAbsent()} has a TOCTOU window: another thread can insert the same
+     * key between the miss and the conditional put. When this happens the loader
+     * is invoked but its result is discarded. For expensive loaders (DB queries,
+     * RPCs), use external per-key synchronization (e.g., Striped locks) if
+     * duplicate computation is unacceptable.
+     *
      * @param key    the key
      * @param loader function to compute the value
      * @return the existing value if present, or the newly computed value
@@ -70,7 +75,10 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
 
     /**
      * Compute a value with TTL for the key if it's not already present.
-     * 
+     *
+     * <p><b>Not atomic.</b> See {@link #computeIfAbsent(Object, Function)} for
+     * concurrency caveats.
+     *
      * @param key    the key
      * @param loader function to compute the value
      * @param ttl    time-to-live for the computed value
@@ -120,30 +128,62 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
     int size();
 
     /**
-     * Get a value and process it directly off-heap without allocation.
-     * 
+     * <b>EXPERIMENTAL.</b> Get a value and process it directly off-heap without allocation.
+     *
+     * <p>The {@code MemorySegment} passed to the processor points to live off-heap
+     * memory. If another thread evicts or updates (realloc) the same entry while
+     * the processor is executing, the segment may reference freed or reallocated
+     * memory. Callers must accept this risk or use external synchronization.
+     *
+     * @param key       the cache key
      * @param processor function that receives the value's MemorySegment and returns
-     *                  a result
+     *                  a result. Must not store the segment reference.
      * @return result of processor, or null if key not found
      */
     <T> T getZeroCopy(K key, Function<MemorySegment, T> processor);
 
     /**
-     * Get a zero-copy view of a value for large data access.
+     * <b>EXPERIMENTAL.</b> Get a zero-copy view of a value for large data access.
+     *
+     * <p>See {@link CacheValueView} for safety constraints. The view must be
+     * consumed immediately and closed promptly. Do not store it or pass it
+     * to another thread.
+     *
+     * @return a view into the off-heap value, or null if not found
      */
     CacheValueView getView(K key);
 
-    /** Clear all entries. */
+    /**
+     * Remove all entries from the cache.
+     *
+     * <p><b>Performance warning:</b> This method iterates every slot in the
+     * entry pool (O(slotCapacity)) to free allocated blocks and update eviction
+     * state. At large scales (millions of entries) this can block the calling
+     * thread for a significant duration. Prefer letting eviction reclaim entries
+     * naturally, or call from a maintenance thread if a full reset is required.
+     */
     void clear();
 
     /** Get cache statistics. */
     CacheStats getStats();
 
-    /** Get all keys (snapshot). */
-    Set<K> getKeys();
-
     @Override
     void close();
+
+    /**
+     * Release thread-local buffers held by the calling thread.
+     *
+     * <p>RMCache allocates per-thread buffers (4KB-256KB) for zero-allocation
+     * serialization. In application servers with long-lived thread pools
+     * (Tomcat, Netty, etc.), these buffers are never collected until the thread
+     * dies. Call this method from a servlet filter's {@code destroy()}, a
+     * framework shutdown hook, or when retiring threads to prevent memory leaks.
+     *
+     * <p>Safe to call from any thread, even if the thread never used the cache.
+     */
+    static void cleanupThreadLocals() {
+        OffHeapCacheImpl.removeThreadLocals();
+    }
 
     /**
      * Cache statistics.
@@ -154,7 +194,10 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
             long evictions,
             int size,
             long memoryUsedBytes,
-            long memoryTotalBytes) {
+            long memoryTotalBytes,
+            long evictionsBySize,
+            long evictionsByTtl,
+            long evictionsByExplicit) {
         public double hitRate() {
             long total = hits + misses;
             return (total == 0) ? 0.0 : (double) hits / total;

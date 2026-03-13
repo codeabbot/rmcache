@@ -25,9 +25,9 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 
 import java.util.Objects;
-import java.util.Set;
 import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -48,6 +48,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     /**
      * High-performance Cache Context to unify ThreadLocals.
      * Shaves off redundant ThreadLocal.get() calls.
+     *
+     * <p><b>Thread-local leak note:</b> Each thread that calls get/put holds
+     * a 4KB-256KB buffer until the thread dies. In container/app-server
+     * environments with long-lived thread pools (Tomcat, Netty), call
+     * {@link OffHeapCache#cleanupThreadLocals()} on thread retirement or
+     * app undeploy to release these buffers.
      */
     static class CacheContext {
         private static final int INITIAL_BUFFER_SIZE = 4 * 1024; // 4KB initial, grows lazily
@@ -80,10 +86,34 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final LongAdder globalHits = new LongAdder();
     private final LongAdder globalMisses = new LongAdder();
     private final LongAdder globalEvictions = new LongAdder();
+    private final LongAdder evictionsBySize = new LongAdder();
+    private final LongAdder evictionsByTtl = new LongAdder();
+    private final LongAdder evictionsByExplicit = new LongAdder();
 
     private volatile boolean closed = false;
 
     private final ThreadLocal<CacheContext> context = ThreadLocal.withInitial(CacheContext::new);
+
+    /**
+     * ISSUE-007: Release thread-local buffers for the calling thread.
+     * Called via {@link OffHeapCache#cleanupThreadLocals()}.
+     */
+    static void removeThreadLocals() {
+        ThreadLocalKeyBuffer.cleanup();
+    }
+
+    /**
+     * ISSUE-008: Murmur-style hash spread to reduce collision clustering.
+     * Java's String.hashCode() has known collision patterns (short strings,
+     * numeric strings) that degrade Robin Hood probing to O(n).
+     */
+    private static int spread(int hash) {
+        int h = hash;
+        h ^= h >>> 16;
+        h *= 0x85ebca6b;
+        h ^= h >>> 13;
+        return h;
+    }
 
     private final ScheduledExecutorService maintenanceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "rmcache-maintenance");
@@ -102,6 +132,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     // O1: Pre-computed ghost cache presence flags
     private final boolean hasGhostCache;
     private final boolean hasOffHeapGhostCache;
+
+    private final Executor asyncExecutor;
 
     private final boolean backgroundEviction;
     private final long backgroundEvictionIntervalMs;
@@ -122,6 +154,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             EvictionFilter<K> evictionFilter,
             GhostCache<K, V> ghostCache,
             OffHeapGhostCache offHeapGhostCache,
+            Executor asyncExecutor,
             boolean backgroundEviction,
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
@@ -142,6 +175,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.evictionFilter = evictionFilter;
         this.ghostCache = ghostCache;
         this.offHeapGhostCache = offHeapGhostCache;
+        this.asyncExecutor = asyncExecutor;
 
         this.isStringKey = keySerializer instanceof StringKeySerializer;
         this.isLatin1Key = (keySerializer instanceof StringKeySerializer s) && s.isLatin1FastPath();
@@ -282,7 +316,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     }
 
     private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         CacheContext ctx = context.get();
 
@@ -498,7 +532,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             return null;
 
         CacheContext ctx = context.get();
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         if (hasGhostCache) {
             V ghostHit = ghostCache.get(key, keyHash);
@@ -610,7 +644,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     public boolean remove(K key) {
         Objects.requireNonNull(key, "key must not be null");
         checkNotClosed();
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
         byte[] keyBytes = null;
         int keyLen = 0;
         int slot;
@@ -715,19 +749,18 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return result;
     }
 
-    // H3 note: putAsync/getAsync delegate to ForkJoinPool.commonPool() which has
-    // an unbounded submission queue. At 1B-scale throughput (millions of async
-    // ops/sec), this can create GC pressure and latency spikes. For production
-    // use at scale, prefer synchronous put/get or provide a bounded executor.
-    // TODO: Accept an optional Executor via CacheBuilder for async operations.
     @Override
     public CompletableFuture<Void> putAsync(K key, V value) {
-        return CompletableFuture.runAsync(() -> put(key, value));
+        return (asyncExecutor != null)
+                ? CompletableFuture.runAsync(() -> put(key, value), asyncExecutor)
+                : CompletableFuture.runAsync(() -> put(key, value));
     }
 
     @Override
     public CompletableFuture<V> getAsync(K key) {
-        return CompletableFuture.supplyAsync(() -> get(key));
+        return (asyncExecutor != null)
+                ? CompletableFuture.supplyAsync(() -> get(key), asyncExecutor)
+                : CompletableFuture.supplyAsync(() -> get(key));
     }
 
     @Override
@@ -738,13 +771,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public int size() {
         return (int) hashTable.size();
-    }
-
-    @Override
-    public Set<K> getKeys() {
-        throw new UnsupportedOperationException(
-                "getKeys() is not supported by OffHeapCacheImpl. " +
-                        "Off-heap entries cannot be iterated without full key deserialization.");
     }
 
     @Override
@@ -773,7 +799,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 globalEvictions.sum(),
                 size(),
                 allocator.getUsedBytes(),
-                allocator.getTotalBytes());
+                allocator.getTotalBytes(),
+                evictionsBySize.sum(),
+                evictionsByTtl.sum(),
+                evictionsByExplicit.sum());
     }
 
     private void removeInternal(int keyHash, byte[] keyBytes, int keyLen, int slot, EvictionCause cause) {
@@ -800,8 +829,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 evictionPolicy.onRemove(removedSlot);
                 entryPool.free(removedSlot);
 
-                if (cause != EvictionCause.EXPLICIT)
-                    globalEvictions.increment();
+                switch (cause) {
+                    case SIZE     -> { globalEvictions.increment(); evictionsBySize.increment(); }
+                    case EXPIRED  -> { globalEvictions.increment(); evictionsByTtl.increment(); }
+                    case EXPLICIT -> evictionsByExplicit.increment();
+                    default       -> globalEvictions.increment();
+                }
             }
         }
     }
@@ -916,7 +949,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         Objects.requireNonNull(processor, "processor must not be null");
         if (closed)
             return null;
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         int slot = 0;
         byte[] keyBytes = null;
@@ -998,7 +1031,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         Objects.requireNonNull(key, "key must not be null");
         if (closed)
             return null;
-        int keyHash = (isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key);
+        int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         int slot = 0;
         if (offHeapGhostCache != null) {

@@ -39,7 +39,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
     private final int[][] buffers;
     private final AtomicInteger[] bufferIndices;
 
-    private final AtomicInteger _size = new AtomicInteger(0);
+    private final AtomicInteger entryCount = new AtomicInteger(0);
     private Runnable maintenanceCallback;
 
     // REG-1 fix: Pre-allocated shard batch arrays for drainBuffers().
@@ -147,7 +147,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         shardLocks[shard].lock();
         try {
             shards[shard].addToWindow(slot);
-            _size.incrementAndGet();
+            entryCount.incrementAndGet();
 
             if (shards[shard].windowSize > windowPerShard) {
                 int victim = shards[shard].pollWindow();
@@ -166,7 +166,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
         boolean removed;
         shardLocks[shard].lock();
         try {
-            // H3 fix: only decrement _size if the slot was actually in an LRU list.
+            // H3 fix: only decrement entryCount if the slot was actually in an LRU list.
             // selectVictim() calls poll*() which clears the segment to NONE,
             // so if onRemove is called after selectVictim, remove() returns false
             // and we skip the decrement. For direct removes (not via eviction),
@@ -176,7 +176,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
             shardLocks[shard].unlock();
         }
         if (removed) {
-            _size.decrementAndGet();
+            entryCount.decrementAndGet();
         }
     }
 
@@ -192,17 +192,17 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
                     int victim = shards[shard].pollProbation();
                     // H3 fix: decrement here since poll already removed from list;
                     // onRemove will see segment=NONE and skip double-decrement.
-                    _size.decrementAndGet();
+                    entryCount.decrementAndGet();
                     return victim;
                 }
                 if (shards[shard].protectedSize > 0) {
                     int victim = shards[shard].pollProtected();
-                    _size.decrementAndGet();
+                    entryCount.decrementAndGet();
                     return victim;
                 }
                 if (shards[shard].windowSize > 0) {
                     int victim = shards[shard].pollWindow();
-                    _size.decrementAndGet();
+                    entryCount.decrementAndGet();
                     return victim;
                 }
             } finally {
@@ -214,7 +214,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public boolean shouldEvict() {
-        return _size.get() >= maxEntries;
+        return entryCount.get() >= maxEntries;
     }
 
     @Override
@@ -288,7 +288,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public int size() {
-        return _size.get();
+        return entryCount.get();
     }
 
     @Override

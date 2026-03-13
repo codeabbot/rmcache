@@ -11,7 +11,7 @@ public interface ValueWriter {
      * @param segment destination segment (typically NativeMemory.UNLIMITED)
      * @param offset  destination offset
      * @param maxLen  maximum bytes allowed
-     * @return actual bytes written (must be <= maxLen)
+     * @return actual bytes written (must be {@literal <=} maxLen)
      */
     int write(MemorySegment segment, long offset, int maxLen);
 }

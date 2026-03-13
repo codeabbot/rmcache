@@ -10,7 +10,7 @@ import java.lang.foreign.ValueLayout;
  *
  * Packed format (64 bits): [offset:40 | capacity:20 | sizeClass:4]
  * - offset: 40 bits → up to 1 TB addressable
- * - capacity: 20 bits → up to 1 MB block size (actual capacity = raw << 6, so
+ * - capacity: 20 bits → up to 1 MB block size (actual capacity = raw {@literal <<} 6, so
  * up to 64 MB)
  * - sizeClass: 4 bits → 0-10 for slab classes, 15 for large (-1 mapped to 0xF)
  *

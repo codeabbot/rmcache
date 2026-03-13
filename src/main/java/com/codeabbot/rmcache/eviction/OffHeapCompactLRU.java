@@ -98,6 +98,8 @@ public class OffHeapCompactLRU implements AutoCloseable {
     }
 
     public void addToWindow(int slot) {
+        // ISSUE-009: Skip if already in a list (prevents linked-list corruption from duplicate insert)
+        if (getSegment(slot) != NONE) return;
         if (headWindow == NONE) {
             headWindow = slot;
             tailWindow = slot;
@@ -136,6 +138,7 @@ public class OffHeapCompactLRU implements AutoCloseable {
     }
 
     public void addToProbation(int slot) {
+        if (getSegment(slot) != NONE) return;
         if (headProbation == NONE) {
             headProbation = slot;
             tailProbation = slot;
@@ -173,6 +176,7 @@ public class OffHeapCompactLRU implements AutoCloseable {
     }
 
     public void addToProtected(int slot) {
+        if (getSegment(slot) != NONE) return;
         if (headProtected == NONE) {
             headProtected = slot;
             tailProtected = slot;

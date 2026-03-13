@@ -3,6 +3,7 @@ package com.codeabbot.rmcache.eviction;
 import com.codeabbot.rmcache.memory.NativeMemory;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.VarHandle;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -13,6 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * @author Rabindra Meher
  */
 class OffHeapFrequencySketch implements AutoCloseable {
+    private static final VarHandle LONG_HANDLE = ValueLayout.JAVA_LONG.varHandle();
+
     private final MemorySegment table;
     private final int tableMask;
     private final AtomicInteger sampleSize = new AtomicInteger(0); // H2 fix: atomic to prevent race
@@ -92,21 +95,18 @@ class OffHeapFrequencySketch implements AutoCloseable {
         sampleSize.updateAndGet(v -> v >>> 1);
     }
 
-    // C3 note: incrementAt uses non-atomic read-modify-write. Under concurrent
-    // access, lost updates can occur. This is a CONSCIOUS DESIGN CHOICE for a
-    // frequency sketch: Count-Min Sketches are inherently approximate (they only
-    // over-count, never under-count in the sequential case). The lost updates
-    // introduce ~1-5% additional imprecision at high concurrency, which is
-    // acceptable given that the sketch's built-in error rate is already ~1-10%.
-    // Using CAS here would add ~30% latency to the hot path for negligible
-    // accuracy improvement.
+    // ISSUE-014: Single-attempt CAS to avoid lost counter updates under contention.
+    // No retry on CAS failure — the sketch is approximate by design, so occasional
+    // lost increments are acceptable. This provides better correctness than plain
+    // read-modify-write with minimal overhead (single CAS, no spin).
     private void incrementAt(int tableIndex, int slot) {
-        int offset = slot * 4;
-        long value = table.get(ValueLayout.JAVA_LONG, (long) tableIndex * 8);
-        long counter = (value >>> offset) & 0xFL;
+        int shift = slot * 4;
+        long byteOffset = (long) tableIndex * 8;
+        long value = (long) LONG_HANDLE.getVolatile(table, byteOffset);
+        long counter = (value >>> shift) & 0xFL;
 
         if (counter < 15) {
-            table.set(ValueLayout.JAVA_LONG, (long) tableIndex * 8, value + (1L << offset));
+            LONG_HANDLE.compareAndExchange(table, byteOffset, value, value + (1L << shift));
         }
     }
 

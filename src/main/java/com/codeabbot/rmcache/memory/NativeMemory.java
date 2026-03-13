@@ -26,8 +26,17 @@ public final class NativeMemory {
             FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG));
 
     /**
-     * Global "Unlimited" segment for raw access.
-     * Dangerous but fast.
+     * Global "Unlimited" segment for raw off-heap access.
+     *
+     * <p>This is a {@code MemorySegment.ofAddress(0L).reinterpret(Long.MAX_VALUE)},
+     * giving unrestricted read/write access to the entire process address space.
+     * Any offset arithmetic bug will result in <b>silent memory corruption</b> or a
+     * <b>JVM crash (SIGSEGV)</b>. This is a conscious design choice: bounds-checked
+     * segments add 2-5ns per access, which at billion-entry scale is a measurable
+     * overhead on the critical GET/PUT path.
+     *
+     * <p><b>Internal use only.</b> All user-facing surfaces ({@code CacheValueView},
+     * {@code getZeroCopy}) perform their own bounds validation before delegating here.
      */
     public static final MemorySegment UNLIMITED = MemorySegment.ofAddress(0L).reinterpret(Long.MAX_VALUE);
 

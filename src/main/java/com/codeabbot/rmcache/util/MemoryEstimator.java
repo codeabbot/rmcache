@@ -4,7 +4,7 @@ import com.codeabbot.rmcache.GhostCacheMode;
 import com.codeabbot.rmcache.index.EntryBlockLayout;
 
 /**
- * Estimates RMCache and NMA memory usage based on entry count and key/value sizes.
+ * Estimates RMCache memory usage based on entry count and key/value sizes.
  */
 public final class MemoryEstimator {
 
@@ -100,14 +100,6 @@ public final class MemoryEstimator {
                 hashTableBytes);
     }
 
-    public static NmaEstimate estimateNma(long entries, int keySize, int valueSize, int pageSizeBytes,
-            int perEntryOverheadBytes) {
-        int payload = keySize + valueSize + perEntryOverheadBytes;
-        int pages = (int) Math.ceil(payload / (double) pageSizeBytes);
-        long offHeapBytes = entries * (long) pages * pageSizeBytes;
-        return new NmaEstimate(entries, pageSizeBytes, perEntryOverheadBytes, offHeapBytes);
-    }
-
     private static int computeSlotCapacity(long maxEntries, int partitions) {
         int shift = 0;
         int pSize = 1;
@@ -195,16 +187,5 @@ public final class MemoryEstimator {
             long totalIndexBytes,
             long fixedIndexBytes,
             long hashTableBytes) {
-    }
-
-    public record NmaEstimate(
-            long entries,
-            int pageSizeBytes,
-            int perEntryOverheadBytes,
-            long offHeapBytes) {
-
-        public double bytesPerEntry() {
-            return (entries == 0) ? 0.0 : (double) offHeapBytes / (double) entries;
-        }
     }
 }

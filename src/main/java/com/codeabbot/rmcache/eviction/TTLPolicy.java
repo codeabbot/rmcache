@@ -29,7 +29,7 @@ public class TTLPolicy implements EvictionPolicy {
     private final long defaultTTLMs; // retained for API/logging purposes
     private final int maxEntries;
     private final OffHeapTimingWheel wheel;
-    private final AtomicInteger _size = new AtomicInteger(0);
+    private final AtomicInteger entryCount = new AtomicInteger(0);
 
     /**
      * @param defaultTTLMs default TTL in milliseconds
@@ -69,7 +69,7 @@ public class TTLPolicy implements EvictionPolicy {
 
     @Override
     public int size() {
-        return _size.get();
+        return entryCount.get();
     }
 
     @Override
@@ -89,7 +89,7 @@ public class TTLPolicy implements EvictionPolicy {
         if (wheel != null) {
             wheel.schedule(slot);
         }
-        _size.incrementAndGet();
+        entryCount.incrementAndGet();
     }
 
     /**
@@ -102,7 +102,7 @@ public class TTLPolicy implements EvictionPolicy {
         if (wheel != null) {
             wheel.schedule(slot);
         }
-        _size.incrementAndGet();
+        entryCount.incrementAndGet();
     }
 
     @Override
@@ -110,16 +110,16 @@ public class TTLPolicy implements EvictionPolicy {
         if (wheel != null) {
             wheel.cancel(slot);
         }
-        // P3-C2 + REG-2 fix: Clamp to prevent negative _size (P3-C2),
+        // P3-C2 + REG-2 fix: Clamp to prevent negative entryCount (P3-C2),
         // using manual CAS instead of updateAndGet(lambda) (REG-2).
         // updateAndGet allocates a lambda capture + uses CAS retry;
         // this manual loop skips entirely when already at zero.
         int prev;
         do {
-            prev = _size.get();
+            prev = entryCount.get();
             if (prev <= 0)
                 return;
-        } while (!_size.compareAndSet(prev, prev - 1));
+        } while (!entryCount.compareAndSet(prev, prev - 1));
     }
 
     @Override
@@ -133,7 +133,7 @@ public class TTLPolicy implements EvictionPolicy {
     public boolean shouldEvict() {
         if (wheel != null && wheel.hasExpired())
             return true;
-        return _size.get() >= maxEntries;
+        return entryCount.get() >= maxEntries;
     }
 
     /**

@@ -9,9 +9,7 @@ import java.lang.foreign.ValueLayout;
  * Off-heap L1 cache storing (hash, slot) pairs for hot keys.
  * Direct-mapped, best-effort, zero-heap.
  *
- * <p>
- * 
- * @implNote This cache uses <b>plain (non-volatile)</b> 64-bit reads and writes
+ * <p><b>Implementation note:</b> This cache uses <b>plain (non-volatile)</b> 64-bit reads and writes
  *           for maximum throughput. Under concurrent access, a torn read may
  *           observe the
  *           upper 32 bits (hash) from one entry and the lower 32 bits (slot)

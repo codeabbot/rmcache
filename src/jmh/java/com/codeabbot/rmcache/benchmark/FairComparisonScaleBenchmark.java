@@ -7,26 +7,26 @@ import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import com.codeabbot.rmcache.serializer.StringEncoding;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
-import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
-import com.target.nativememoryallocator.map.NativeMemoryMap;
-import com.target.nativememoryallocator.map.NativeMemoryMapBackend;
-import com.target.nativememoryallocator.map.NativeMemoryMapBuilder;
-import com.target.nativememoryallocator.map.NativeMemoryMapSerializer;
-
+import net.openhft.chronicle.map.ChronicleMap;
+import org.ehcache.CacheManager;
+import org.ehcache.config.builders.CacheConfigurationBuilder;
+import org.ehcache.config.builders.CacheManagerBuilder;
+import org.ehcache.config.builders.ResourcePoolsBuilder;
+import org.ehcache.config.units.MemoryUnit;
+import org.mapdb.DB;
+import org.mapdb.HTreeMap;
 import org.openjdk.jmh.annotations.*;
 
+import java.io.IOException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import org.ehcache.config.units.MemoryUnit;
-import org.ehcache.CacheManager;
-import org.ehcache.config.builders.CacheManagerBuilder;
-import org.ehcache.config.builders.CacheConfigurationBuilder;
-import org.ehcache.config.builders.ResourcePoolsBuilder;
 
 /**
- * Fair benchmark comparison for 10k and 100k entries.
+ * Fair latency benchmark across 10k / 100k / 1M entry scales.
+ *
+ * <p>Competitors: RMCache (plain + OFF_HEAP GhostCache), MapDB, ChronicleMap, EhCache.
+ * All caches pre-allocated at 8 GB to avoid eviction during measurement.
+ * No eviction policy — pure read/write latency, no eviction overhead.
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.AverageTime)
@@ -37,27 +37,28 @@ import org.ehcache.config.builders.ResourcePoolsBuilder;
 @Threads(4)
 public class FairComparisonScaleBenchmark {
 
-    @Param({ "10000", "100000", "1000000" })
+    @Param({"10000", "100000", "1000000"})
     public int entryCount = 10000;
 
     @Param("256")
     public int valueSize = 256;
 
     private OffHeapCache<String, byte[]> rmcache;
-    private OffHeapCache<String, byte[]> rmcacheGhost; // with OFF_HEAP GhostCache
-    private NativeMemoryMap<String, byte[]> nmaMap;
+    private OffHeapCache<String, byte[]> rmcacheGhost;
+    private DB mapDB;
+    private HTreeMap<String, byte[]> mapDBMap;
+    private ChronicleMap<String, byte[]> chronicleMap;
     private org.ehcache.Cache<String, byte[]> ehcache;
     private CacheManager ehcacheManager;
 
     @Setup(Level.Trial)
-    public void setup() {
+    public void setup() throws IOException {
         System.out.println("\nSetup scale test for " + entryCount + " entries...");
 
-        // RMCache without GhostCache (random access) + NO eviction (fair comparison)
-        // Allocate 8GB to handle 1M+ entries + metadata comfortably
+        // ── RMCache (no ghost cache) ──────────────────────────────────────────
         rmcache = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(8))
-                .maxEntries(entryCount * 2) // Handle 1M entries comfortably
+                .maxEntries(entryCount * 2)
                 .stringKeyEncoding(StringEncoding.LATIN1)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .eviction(new NoEvictionPolicy())
@@ -67,7 +68,7 @@ public class FairComparisonScaleBenchmark {
                 .withCacheName("benchmark")
                 .build();
 
-        // RMCache WITH OFF_HEAP GhostCache
+        // ── RMCache (with OFF_HEAP GhostCache) ───────────────────────────────
         rmcacheGhost = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(8))
                 .maxEntries(entryCount * 2)
@@ -76,60 +77,48 @@ public class FairComparisonScaleBenchmark {
                 .eviction(new NoEvictionPolicy())
                 .hashTableLoadFactor(0.5d)
                 .ghostCacheMode(GhostCacheMode.OFF_HEAP)
-                .ghostCacheSize(entryCount * 2) // Size ghost cache to cover all entries
+                .ghostCacheSize(entryCount * 2)
                 .build();
 
-        // NMA allocator + Map (Using 8GB as requested to prevent breaking)
-        // Set pageSizeBytes to 512 to handle 10M entries (approx 5GB if 1 page per
-        // entry)
-        NativeMemoryAllocator nmaAllocator = new NativeMemoryAllocatorBuilder(
-                512,
-                8L * 1024 * 1024 * 1024,
-                false).build();
+        // ── MapDB (off-heap memory map) ───────────────────────────────────────
+        mapDB = MapDBFactory.createDB();
+        mapDBMap = MapDBFactory.createMap(mapDB);
 
-        nmaMap = NMAFactory.createMap(
-                new ByteArraySerializer(),
-                nmaAllocator,
-                NativeMemoryMapBackend.CONCURRENT_HASH_MAP);
+        // ── ChronicleMap (off-heap mmap) ──────────────────────────────────────
+        chronicleMap = ChronicleMapFactory.createMap(entryCount * 2, valueSize);
 
-        // Ehcache Setup
+        // ── EhCache (off-heap) ────────────────────────────────────────────────
         ehcacheManager = CacheManagerBuilder.newCacheManagerBuilder().build(true);
         ehcache = ehcacheManager.createCache("benchmarkCache",
                 CacheConfigurationBuilder.newCacheConfigurationBuilder(
                         String.class, byte[].class,
                         ResourcePoolsBuilder.newResourcePoolsBuilder()
-                                .offheap(8, MemoryUnit.GB))
+                                .offheap(512, MemoryUnit.MB))
                         .build());
 
-        // Pre-populate
+        // ── Pre-populate ──────────────────────────────────────────────────────
         byte[] value = new byte[valueSize];
         for (int i = 0; i < entryCount; i++) {
             String key = "key-" + i;
             rmcache.put(key, value);
             rmcacheGhost.put(key, value);
-            nmaMap.put(key, value);
+            mapDBMap.put(key, value);
+            chronicleMap.put(key, value);
             ehcache.put(key, value);
-            if (i > 0 && i % 1_000_000 == 0) {
-                System.out.println("Loaded " + i + " entries...");
-            }
         }
         System.out.println("Setup complete for " + entryCount + " entries.\n");
     }
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        if (rmcache != null) {
-            rmcache.close();
-        }
-        if (rmcacheGhost != null) {
-            rmcacheGhost.close();
-        }
-        if (ehcacheManager != null) {
-            ehcacheManager.close();
-        }
+        if (rmcache != null) rmcache.close();
+        if (rmcacheGhost != null) rmcacheGhost.close();
+        if (mapDB != null) mapDB.close();
+        if (chronicleMap != null) chronicleMap.close();
+        if (ehcacheManager != null) ehcacheManager.close();
     }
 
-    // ========== GET Benchmarks ==========
+    // ── RMCache GET / PUT ────────────────────────────────────────────────────
 
     @Benchmark
     public byte[] rmcacheGet() {
@@ -144,35 +133,46 @@ public class FairComparisonScaleBenchmark {
     }
 
     @Benchmark
-    public byte[] nmaGet() {
-        int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        return nmaMap.get("key-" + idx);
-    }
-
-    // ========== PUT Benchmarks ==========
-
-    @Benchmark
     public void rmcachePut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        byte[] value = new byte[valueSize];
-        rmcache.put("key-" + idx, value);
+        rmcache.put("key-" + idx, new byte[valueSize]);
     }
 
     @Benchmark
     public void rmcacheGhostPut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        byte[] value = new byte[valueSize];
-        rmcacheGhost.put("key-" + idx, value);
+        rmcacheGhost.put("key-" + idx, new byte[valueSize]);
+    }
+
+    // ── MapDB GET / PUT ──────────────────────────────────────────────────────
+
+    @Benchmark
+    public byte[] mapdbGet() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return mapDBMap.get("key-" + idx);
     }
 
     @Benchmark
-    public void nmaPut() {
+    public void mapdbPut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        byte[] value = new byte[valueSize];
-        nmaMap.put("key-" + idx, value);
+        mapDBMap.put("key-" + idx, new byte[valueSize]);
     }
 
-    // ========== EHCACHE Benchmarks ==========
+    // ── ChronicleMap GET / PUT ───────────────────────────────────────────────
+
+    @Benchmark
+    public byte[] chronicleGet() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return chronicleMap.get("key-" + idx);
+    }
+
+    @Benchmark
+    public void chroniclePut() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        chronicleMap.put("key-" + idx, new byte[valueSize]);
+    }
+
+    // ── EhCache GET / PUT ────────────────────────────────────────────────────
 
     @Benchmark
     public byte[] ehcacheGet() {
@@ -183,19 +183,6 @@ public class FairComparisonScaleBenchmark {
     @Benchmark
     public void ehcachePut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        byte[] value = new byte[valueSize];
-        ehcache.put("key-" + idx, value);
-    }
-
-    private static class ByteArraySerializer implements NativeMemoryMapSerializer<byte[]> {
-        @Override
-        public byte[] deserializeFromOnHeapMemoryBuffer(OnHeapMemoryBuffer onHeapMemoryBuffer) {
-            return onHeapMemoryBuffer.toTrimmedArray();
-        }
-
-        @Override
-        public byte[] serializeToByteArray(byte[] value) {
-            return value;
-        }
+        ehcache.put("key-" + idx, new byte[valueSize]);
     }
 }

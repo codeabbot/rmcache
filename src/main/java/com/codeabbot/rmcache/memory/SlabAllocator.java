@@ -169,15 +169,19 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         }
     }
 
+    /**
+     * ISSUE-005 fix: Return null on OOM instead of throwing, consistent with
+     * slab path behavior. Callers (allocate, allocatePacked) already handle null/-1L.
+     */
     private AllocationHandle allocateLarge(int sizeBytes) {
         if (buddySize == 0) {
-            throw new IllegalStateException("Large allocation not supported for small heaps");
+            return null;
         }
         largeLock.lock();
         try {
             long offset = buddyAllocator.allocate(sizeBytes);
             if (offset < 0) {
-                throw new IllegalStateException("OOM Large");
+                return null;
             }
             largeAllocations.put(offset, sizeBytes);
             allocationCount.add(1);
@@ -239,6 +243,7 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         if (classIndex < 0 || sizeBytes > LARGE_THRESHOLD) {
             // Fall back to object-based path for large allocations (rare)
             AllocationHandle h = allocateLarge(sizeBytes);
+            if (h == null) return -1L;
             return AllocationHandle.pack(h.getOffset(), h.getCapacity(), h.getSizeClass());
         }
 

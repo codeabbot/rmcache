@@ -7,21 +7,20 @@ import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import com.codeabbot.rmcache.serializer.StringEncoding;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
-import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
-import com.target.nativememoryallocator.map.NativeMemoryMap;
-import com.target.nativememoryallocator.map.NativeMemoryMapBackend;
-import com.target.nativememoryallocator.map.NativeMemoryMapBuilder;
-import com.target.nativememoryallocator.map.NativeMemoryMapSerializer;
+import net.openhft.chronicle.map.ChronicleMap;
+import org.mapdb.DB;
+import org.mapdb.HTreeMap;
 import org.openjdk.jmh.annotations.*;
 
+import java.io.IOException;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Comparative workload benchmark: Read-Only, Write-Only, and Read/Write
- * (Mixed).
+ * Throughput benchmark for Read-Only, Write-Only, and Mixed (3R:1W) workloads.
+ *
+ * <p>Competitors: RMCache, MapDB, ChronicleMap.
+ * Metric: operations per second (higher is better).
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.Throughput)
@@ -32,20 +31,22 @@ import java.util.concurrent.TimeUnit;
 @Threads(4)
 public class ComparativeWorkloadBenchmark {
 
-    @Param({ "10000", "100000", "1000000" })
+    @Param({"10000", "100000", "1000000"})
     public int entryCount = 10000;
 
     @Param("256")
     public int valueSize = 256;
 
     private OffHeapCache<String, byte[]> rmcache;
-    private NativeMemoryMap<String, byte[]> nmaMap;
+    private DB mapDB;
+    private HTreeMap<String, byte[]> mapDBMap;
+    private ChronicleMap<String, byte[]> chronicleMap;
 
     private String[] keys;
     private byte[][] values;
 
     @Setup(Level.Trial)
-    public void setup() {
+    public void setup() throws IOException {
         System.out.println("\n--- Setup Comparative Workload for " + entryCount + " entries ---");
 
         keys = new String[entryCount];
@@ -57,7 +58,7 @@ public class ComparativeWorkloadBenchmark {
             values[i] = new byte[valueSize];
         }
 
-        // RMCache Setup
+        // ── RMCache ───────────────────────────────────────────────────────────
         rmcache = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(8))
                 .maxEntries(entryCount * 2)
@@ -69,34 +70,31 @@ public class ComparativeWorkloadBenchmark {
                 .ghostCacheSize(0)
                 .build();
 
-        // NMA Setup
-        NativeMemoryAllocator nmaAllocator = new NativeMemoryAllocatorBuilder(
-                4096,
-                Units.gigabytes(8),
-                false).build();
+        // ── MapDB ─────────────────────────────────────────────────────────────
+        mapDB = MapDBFactory.createDB();
+        mapDBMap = MapDBFactory.createMap(mapDB);
 
-        nmaMap = NMAFactory.createMap(
-                new ByteArraySerializer(),
-                nmaAllocator,
-                NativeMemoryMapBackend.CONCURRENT_HASH_MAP);
+        // ── ChronicleMap ──────────────────────────────────────────────────────
+        chronicleMap = ChronicleMapFactory.createMap(entryCount * 2, valueSize);
 
-        // Pre-populate
+        // ── Pre-populate ──────────────────────────────────────────────────────
         for (int i = 0; i < entryCount; i++) {
             byte[] v = values[i % 1024];
             rmcache.put(keys[i], v);
-            nmaMap.put(keys[i], v);
+            mapDBMap.put(keys[i], v);
+            chronicleMap.put(keys[i], v);
         }
         System.out.println("--- Setup Complete ---\n");
     }
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        if (rmcache != null) {
-            rmcache.close();
-        }
+        if (rmcache != null) rmcache.close();
+        if (mapDB != null) mapDB.close();
+        if (chronicleMap != null) chronicleMap.close();
     }
 
-    // ========== RMCache Workloads ==========
+    // ── RMCache Workloads ─────────────────────────────────────────────────────
 
     @Benchmark
     public byte[] rmcache_ReadOnly() {
@@ -126,45 +124,63 @@ public class ComparativeWorkloadBenchmark {
         rmcache.put(keys[idx], values[idx % 1024]);
     }
 
-    // ========== NMA Workloads ==========
+    // ── MapDB Workloads ───────────────────────────────────────────────────────
 
     @Benchmark
-    public byte[] nma_ReadOnly() {
+    public byte[] mapdb_ReadOnly() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        return nmaMap.get(keys[idx]);
+        return mapDBMap.get(keys[idx]);
     }
 
     @Benchmark
-    public void nma_WriteOnly() {
+    public void mapdb_WriteOnly() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        nmaMap.put(keys[idx], values[idx % 1024]);
+        mapDBMap.put(keys[idx], values[idx % 1024]);
     }
 
-    @Group("nmaMixed")
+    @Group("mapdbMixed")
     @GroupThreads(3)
     @Benchmark
-    public byte[] nma_Mixed_Read() {
+    public byte[] mapdb_Mixed_Read() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        return nmaMap.get(keys[idx]);
+        return mapDBMap.get(keys[idx]);
     }
 
-    @Group("nmaMixed")
+    @Group("mapdbMixed")
     @GroupThreads(1)
     @Benchmark
-    public void nma_Mixed_Write() {
+    public void mapdb_Mixed_Write() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        nmaMap.put(keys[idx], values[idx % 1024]);
+        mapDBMap.put(keys[idx], values[idx % 1024]);
     }
 
-    private static class ByteArraySerializer implements NativeMemoryMapSerializer<byte[]> {
-        @Override
-        public byte[] deserializeFromOnHeapMemoryBuffer(OnHeapMemoryBuffer onHeapMemoryBuffer) {
-            return onHeapMemoryBuffer.toTrimmedArray();
-        }
+    // ── ChronicleMap Workloads ────────────────────────────────────────────────
 
-        @Override
-        public byte[] serializeToByteArray(byte[] value) {
-            return value;
-        }
+    @Benchmark
+    public byte[] chronicle_ReadOnly() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return chronicleMap.get(keys[idx]);
+    }
+
+    @Benchmark
+    public void chronicle_WriteOnly() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        chronicleMap.put(keys[idx], values[idx % 1024]);
+    }
+
+    @Group("chronicleMixed")
+    @GroupThreads(3)
+    @Benchmark
+    public byte[] chronicle_Mixed_Read() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return chronicleMap.get(keys[idx]);
+    }
+
+    @Group("chronicleMixed")
+    @GroupThreads(1)
+    @Benchmark
+    public void chronicle_Mixed_Write() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        chronicleMap.put(keys[idx], values[idx % 1024]);
     }
 }

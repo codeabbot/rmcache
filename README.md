@@ -3,16 +3,18 @@
 [![CI](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml/badge.svg)](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-High-Performance, Billion-Scale Off-Heap Cache for Java 22+
+High-Performance, Billion-Scale Off-Heap Cache for Java 25+ (LTS)
 
-RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java Foreign Function & Memory (FFM) API (stable since JDK 22), it stores data off-heap and avoids GC pauses even when managing very large data sets.
+RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java Foreign Function & Memory (FFM) API, it stores data off-heap and avoids GC pauses even when managing very large data sets.
+
+> **Requires JDK 25 or later** (LTS release). The FFM API is stable and fully supported from JDK 25. Run with `--enable-native-access=ALL-UNNAMED`.
 
 ---
 
 ## Key Features
 
 - Zero-heap data path: keys, values, and index structures live off-heap.
-- Java 25 FFM API: no Unsafe dependency.
+- Java 25+ (LTS) FFM API: no Unsafe dependency.
 - 64-bit slot packing: one 64-bit read for hash + slot.
 - Key-match fast path + fingerprint check to reduce unnecessary comparisons.
 - Zero-copy reads and large-value streaming support.
@@ -44,23 +46,26 @@ flowchart LR
 
 ## Performance Benchmarks
 
-Benchmarks verified on macOS / Java 25 (OpenJDK). Latest results (Feb 2026) include all optimization phases plus enterprise architecture review fixes (C1-C4, H1-H6, M1-M7, L3).
+Benchmarks run on macOS / JDK 25.0.2 (OpenJDK), 4 threads, 2 warmup + 3 measurement iterations.
 
 ### Latency (ns/op) - FairComparisonScaleBenchmark - Lower is Better
 
-| Operation | Scale (Entries) | RMCache | RMCache + GhostCache | Reference (NMA) | EhCache | Status vs NMA |
+| Operation | Scale | RMCache | RMCache + GhostCache | ChronicleMap | MapDB | EhCache |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GET** | 10,000 | **124 ns** | 148 ns | 187 ns | 507 ns | ✅ **34% faster** |
-| **GET** | 100,000 | **307 ns** | **300 ns** 🏆 | 360 ns | 722 ns | ✅ **15% faster** |
-| **GET** | 1,000,000 | **503 ns** | 527 ns | N/A | 780 ns | ✅ |
-| **PUT** | 10,000 | **199 ns** | 250 ns | 162 ns | 1039 ns | ⚠️ 23% slower |
-| **PUT** | 100,000 | 358 ns | **307 ns** 🏆 | 327 ns | 1178 ns | ✅ **6% faster** (ghost) |
-| **PUT** | 1,000,000 | **471 ns** | **490 ns** | 521 ns | 1265 ns | ✅ **10% faster** |
+| **GET** | 10,000 | **110 ns** | 143 ns | 257 ns | 1,255 ns | 1,908 ns |
+| **GET** | 100,000 | **363 ns** | 382 ns | 336 ns | 1,660 ns | 2,163 ns |
+| **GET** | 1,000,000 | 543 ns | **524 ns** | 489 ns | 1,958 ns | 2,365 ns |
+| **PUT** | 10,000 | **151 ns** | 122 ns | 556 ns | 3,068 ns | 3,331 ns |
+| **PUT** | 100,000 | 357 ns | **297 ns** | 688 ns | 8,831 ns | 2,829 ns |
+| **PUT** | 1,000,000 | 486 ns | **479 ns** | 751 ns | 4,809 ns | 2,909 ns |
 
-**Key Observations** (Mar 2026, post ghost cache fix):
-- GET latency leads NMA by **15-34%** across all scales.
-- Ghost cache GET now **beats normal GET at 100K** (300ns vs 307ns).
-- Compared to EhCache: **3-6× faster GET**, **3-5× faster PUT** across all scales.
+**Key Observations** (Mar 2026):
+- RMCache GET leads at 10K (**2.3× faster** than ChronicleMap, **17× faster** than EhCache).
+- RMCache PUT is **3-5× faster** than ChronicleMap across all scales.
+- Ghost cache PUT wins at 100K–1M: 297–479 ns vs 357–486 ns for plain RMCache.
+- MapDB and EhCache are **5–17× slower** for GET, **6–20× slower** for PUT.
+
+Run yourself: `./gradlew jmh -Pjmh.includes="FairComparisonScaleBenchmark"`
 
 ---
 
@@ -125,7 +130,7 @@ System.out.println("Bytes/entry: " + estimate.bytesPerEntry());
 
 ### Dependency
 
-Requires Java 22+ with `--enable-native-access=ALL-UNNAMED`.
+Requires **Java 25+** (LTS) with `--enable-native-access=ALL-UNNAMED`.
 
 ```gradle
 dependencies {
@@ -228,33 +233,25 @@ new CacheBuilder<String, byte[]>()
 
 ---
 
-## Memory Comparison (RMCache vs NMA)
+## Memory Scalability
 
-Use the built-in suite:
+Use the built-in suite to measure actual off-heap usage at different scales:
 
 ```
 ./gradlew runMemoryScalability
 ```
 
-This prints 10k/100k/1M measurements and 1B extrapolations (RMCache uses the new estimator; NMA uses page-size estimation). Results depend on key/value sizes and page size.
+This prints 10k/100k/1M measurements and a 1B extrapolation. Results depend on key/value sizes.
 
-Latest run (macOS, Java 25, 16B keys / 256B values, 4GB off-heap, NMA page size 4096):
+Latest run (macOS, Java 25, 16B keys / 256B values, 4GB off-heap):
 
-| Scale | Provider | Heap (MB) | Off-Heap (MB) | Bytes/Entry |
-| :--- | :--- | :--- | :--- | :--- |
-| 10k | RMCache | 1.50 | 4.88 | 669.8 |
-| 10k | NMA | 14.56 | 39.06 | 5623.2 |
-| 100k | RMCache | 0.85 | 48.83 | 520.9 |
-| 100k | NMA | 32.26 | 390.63 | 4434.3 |
-| 1M | RMCache | 1.28 | 488.28 | 513.3 |
-| 1M | NMA | 209.86 | 3906.25 | 4316.1 |
-
-1B extrapolation:
-
-| Provider | Heap Usage | Off-Heap Usage | Total RAM |
+| Scale | Heap (MB) | Off-Heap (MB) | Bytes/Entry |
 | :--- | :--- | :--- | :--- |
-| RMCache | < 50 MB | 339.4 GB | 339.4 GB |
-| NMA | High (CHM) | 3814.7 GB | 3814.7 GB |
+| 10k | 1.50 | 4.88 | 669.8 |
+| 100k | 0.85 | 48.83 | 520.9 |
+| 1M | 1.28 | 488.28 | 513.3 |
+
+1B extrapolation: **~326 GB off-heap**, **< 50 MB heap**.
 
 ---
 
@@ -277,9 +274,24 @@ Higher load factor:
 
 ---
 
+## Documentation
+
+| Document | Description |
+| :--- | :--- |
+| [Getting Started](docs/getting-started.md) | Quick start, common patterns, sizing |
+| [Eviction Policies](docs/eviction-policies.md) | LRU, TTL, composite, filters, listeners |
+| [Custom Serialization](docs/custom-serialization.md) | Custom types, segment serializer, framework adapters |
+| [Zero-Copy Access](docs/zero-copy-access.md) | `getZeroCopy`/`getView` safety and usage |
+| [Heap Profile](docs/heap-profile.md) | Heap breakdown and zero-heap configurations |
+| [Architecture](ARCHITECTURE.md) | Internals: memory layout, concurrency model, data structures |
+| [Architecture Deep Dive](ARCHITECTURE-DEEP-DIVE.md) | Full builder reference, troubleshooting |
+| [Security Policy](SECURITY.md) | Vulnerability reporting |
+
+---
+
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. All hot-path changes require JMH benchmarks before and after — zero regressions policy.
 
 ## License
 

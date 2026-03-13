@@ -1,0 +1,48 @@
+/**
+ * Examples subproject — runnable demonstrations of RMCache features.
+ *
+ * Each example has a dedicated Gradle task:
+ *
+ *   ./gradlew :examples:runBasicCacheExample
+ *   ./gradlew :examples:runTTLExample
+ *   ./gradlew :examples:runZeroCopyExample
+ *   ./gradlew :examples:runEvictionExample
+ *   ./gradlew :examples:runCustomSerializerExample
+ */
+plugins {
+    id 'java'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':')
+    implementation libs.slf4j.api
+    runtimeOnly libs.logback.classic
+}
+
+def exampleClasses = [
+    'BasicCacheExample',
+    'TTLExample',
+    'ZeroCopyExample',
+    'EvictionExample',
+    'CustomSerializerExample'
+]
+
+exampleClasses.each { name ->
+    tasks.register("run${name}", JavaExec) {
+        group = 'examples'
+        description = "Run ${name}"
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = "com.codeabbot.rmcache.examples.${name}"
+        jvmArgs("--enable-native-access=ALL-UNNAMED")
+    }
+}

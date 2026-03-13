@@ -4,7 +4,7 @@ Thank you for your interest in contributing to RMCache! This guide will help you
 
 ## Prerequisites
 
-- **JDK 22+** (Foreign Function & Memory API)
+- **JDK 25+** (LTS — Foreign Function & Memory API stable since JDK 25)
 - **Gradle 9.x** (wrapper included: `./gradlew`)
 
 ## Getting Started
@@ -68,9 +68,32 @@ Examples:
 - **Javadoc:** All public classes and methods must have Javadoc
 - **Thread safety:** Document thread-safety guarantees in class-level Javadoc
 
+## Benchmarking Policy
+
+**Zero-regression rule:** Every change that touches the hot path (`get`, `put`, `remove`, allocator, hash table, eviction policy) must run `FairComparisonScaleBenchmark` before and after. A PR that regresses any benchmark metric will not be merged.
+
+```bash
+# Run the comparison benchmark (4 threads, 3 warmup + 5 measurement iterations)
+./gradlew jmh -Pjmh.includes="FairComparisonScaleBenchmark"
+
+# Run the RMCache-only benchmark (faster, for iterative tuning)
+./gradlew jmh -Pjmh.includes="RMCacheOnlyBenchmark"
+```
+
+Include benchmark output in your PR description. Compare before/after at 10K, 100K, and 1M entry scales.
+
+## PR Checklist
+
+Before submitting:
+- [ ] `./gradlew test` passes (all tests green)
+- [ ] If touching hot path: JMH before/after included, no regression
+- [ ] Javadoc added/updated for all public API changes
+- [ ] `CHANGELOG.md` updated under `[Unreleased]`
+- [ ] No `Unsafe` usage — use `java.lang.foreign` APIs only
+
 ## Architecture Overview
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for technical details on the memory management, indexing, and eviction layers.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical design, and [ARCHITECTURE-DEEP-DIVE.md](ARCHITECTURE-DEEP-DIVE.md) for the configuration reference and developer guide.
 
 ## Code of Conduct
 

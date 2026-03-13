@@ -150,7 +150,7 @@ public class EntryPool implements AutoCloseable {
     }
 
     public int getSlotFromOffset(long offset) {
-        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 12);
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, offset + 4);
     }
 
     public boolean keyEqualsWithLen(long offset, byte[] keyBytes, int keyLen) {
@@ -245,7 +245,7 @@ public class EntryPool implements AutoCloseable {
 
     public long getExpiresAt(int slot) {
         long offset = getOffset(slot);
-        return (offset != -1L) ? NativeMemory.UNLIMITED.get(UNALIGNED_LONG, offset + 4) : 0L;
+        return (offset != -1L) ? NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, offset + 8) : 0L;
     }
 
     /**
@@ -255,7 +255,7 @@ public class EntryPool implements AutoCloseable {
     public void clearExpiresAt(int slot) {
         long offset = getOffset(slot);
         if (offset != -1L) {
-            NativeMemory.UNLIMITED.set(UNALIGNED_LONG, offset + 4, 0L);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, offset + 8, 0L);
         }
     }
 
@@ -549,30 +549,32 @@ public class EntryPool implements AutoCloseable {
         public void free(int slot) {
             int localIdx = slot & partitionMask;
             long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
-            if (packed != -1L) {
-                long absOffset = unpackAddr(packed);
-                int sc = unpackSC(packed);
-                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+            if (packed == -1L) return;
 
-                // K2: Invalidate slot BEFORE freeing slab block — prevents concurrent
-                // get() from reading an offset that points to freed memory.
-                LONG_HANDLE.setVolatile(offsets, (long) slot * 8L, -1L);
-
-                long relOffset = absOffset - baseAddr;
-                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
-
-                // H1 fix: Use getAndIncrement instead of CAS loop to avoid
-                // spin-locking under extreme contention with 128+ threads.
-                // P3-C1 fix: Guard against overflow — if freeTop exceeds maxLocal
-                // (double-free or logic error), rollback to prevent writing beyond
-                // the native freeSlots segment boundary.
-                int top = freeTop.getAndIncrement();
-                if (top >= maxLocal) {
-                    freeTop.decrementAndGet(); // rollback — slot was already freed
-                    return;
-                }
-                freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
+            // ISSUE-006: CAS to atomically claim the right to free this slot.
+            // Prevents double-free when two threads race on free() for the same slot.
+            if (!LONG_HANDLE.compareAndSet(offsets, (long) slot * 8L, packed, -1L)) {
+                return; // Another thread already freed this slot
             }
+
+            long absOffset = unpackAddr(packed);
+            int sc = unpackSC(packed);
+            int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+
+            long relOffset = absOffset - baseAddr;
+            allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
+
+            // H1 fix: Use getAndIncrement instead of CAS loop to avoid
+            // spin-locking under extreme contention with 128+ threads.
+            // P3-C1 fix: Guard against overflow — if freeTop exceeds maxLocal
+            // (double-free or logic error), rollback to prevent writing beyond
+            // the native freeSlots segment boundary.
+            int top = freeTop.getAndIncrement();
+            if (top >= maxLocal) {
+                freeTop.decrementAndGet(); // rollback — slot lost
+                return;
+            }
+            freeSlots.setAtIndex(ValueLayout.JAVA_INT, (long) top, localIdx);
         }
 
         // C1 fix: Always lock for in-place value update. The previous lock-free
@@ -751,8 +753,8 @@ public class EntryPool implements AutoCloseable {
 
         private void writeHeader(long offset, int h, int cap, int sc, short p, long exp, int slot, byte fingerprint) {
             NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 0, h);
-            NativeMemory.UNLIMITED.set(UNALIGNED_LONG, offset + 4, exp);
-            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 12, slot);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, offset + 4, slot);
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, offset + 8, exp);
             NativeMemory.UNLIMITED.set(ValueLayout.JAVA_BYTE, offset + 16, (byte) sc);
             NativeMemory.UNLIMITED.set(ValueLayout.JAVA_BYTE, offset + FINGERPRINT_OFFSET, fingerprint);
             NativeMemory.UNLIMITED.set(ValueLayout.JAVA_SHORT, offset + 18, p);

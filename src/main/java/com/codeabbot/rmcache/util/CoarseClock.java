@@ -24,10 +24,14 @@ public final class CoarseClock {
     /**
      * Called when a new cache instance is created.
      * Starts the clock thread on first reference.
+     *
+     * ISSUE-004 fix: Increment refCount inside synchronized block to prevent
+     * race with release(). Previously, release() could shut down the executor
+     * between our increment (outside lock) and our synchronized block entry.
      */
     public static void acquire() {
-        if (refCount.incrementAndGet() == 1) {
-            synchronized (LOCK) {
+        synchronized (LOCK) {
+            if (refCount.incrementAndGet() == 1) {
                 if (clockExecutor == null || clockExecutor.isShutdown()) {
                     clockExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
                         Thread t = new Thread(r, "rmcache-coarse-clock");

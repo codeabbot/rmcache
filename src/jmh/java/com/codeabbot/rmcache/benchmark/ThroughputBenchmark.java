@@ -7,23 +7,23 @@ import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import com.codeabbot.rmcache.serializer.StringEncoding;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocator;
-import com.target.nativememoryallocator.allocator.NativeMemoryAllocatorBuilder;
-import com.target.nativememoryallocator.buffer.OnHeapMemoryBuffer;
-import com.target.nativememoryallocator.map.NativeMemoryMap;
-import com.target.nativememoryallocator.map.NativeMemoryMapBackend;
-import com.target.nativememoryallocator.map.NativeMemoryMapBuilder;
-import com.target.nativememoryallocator.map.NativeMemoryMapSerializer;
+import net.openhft.chronicle.map.ChronicleMap;
+import org.mapdb.DB;
+import org.mapdb.HTreeMap;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
 
+import java.io.IOException;
+import java.lang.foreign.ValueLayout;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import java.lang.foreign.ValueLayout;
 
 /**
- * Dedicated throughput benchmark for 10k, 100k, and 1M entries.
- * Optimized to minimize heap allocations during measurement.
+ * Throughput benchmark: ops/second across 10k / 100k / 1M entry scales.
+ *
+ * <p>Pre-creates keys and values to avoid allocation on the measurement path.
+ * RMCache zero-copy path ({@code getZeroCopy}) is included as an additional
+ * RMCache-specific data point.
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.Throughput)
@@ -34,23 +34,24 @@ import java.lang.foreign.ValueLayout;
 @Threads(4)
 public class ThroughputBenchmark {
 
-    @Param({ "10000", "100000", "1000000" })
+    @Param({"10000", "100000", "1000000"})
     public int entryCount = 10000;
 
     @Param("256")
     public int valueSize = 256;
 
     private OffHeapCache<String, byte[]> rmcache;
-    private NativeMemoryMap<String, byte[]> nmaMap;
+    private DB mapDB;
+    private HTreeMap<String, byte[]> mapDBMap;
+    private ChronicleMap<String, byte[]> chronicleMap;
 
     private String[] keys;
     private byte[][] values;
 
     @Setup(Level.Trial)
-    public void setup() {
+    public void setup() throws IOException {
         System.out.println("\n--- Setup Throughput Benchmark for " + entryCount + " entries ---");
 
-        // Pre-create keys and values to avoid allocation in hot path
         keys = new String[entryCount];
         for (int i = 0; i < entryCount; i++) {
             keys[i] = "key-" + i;
@@ -60,7 +61,7 @@ public class ThroughputBenchmark {
             values[i] = new byte[valueSize];
         }
 
-        // RMCache Setup
+        // ── RMCache ───────────────────────────────────────────────────────────
         rmcache = new CacheBuilder<String, byte[]>()
                 .offHeapMemory(Units.gigabytes(4))
                 .maxEntries(entryCount * 2)
@@ -72,35 +73,31 @@ public class ThroughputBenchmark {
                 .ghostCacheSize(0)
                 .build();
 
-        // NMA Setup
-        NativeMemoryAllocator nmaAllocator = new NativeMemoryAllocatorBuilder(
-                4096,
-                Units.gigabytes(4),
-                false).build();
+        // ── MapDB ─────────────────────────────────────────────────────────────
+        mapDB = MapDBFactory.createDB();
+        mapDBMap = MapDBFactory.createMap(mapDB);
 
-        nmaMap = NMAFactory.createMap(
-                new ByteArraySerializer(),
-                nmaAllocator,
-                NativeMemoryMapBackend.CONCURRENT_HASH_MAP);
+        // ── ChronicleMap ──────────────────────────────────────────────────────
+        chronicleMap = ChronicleMapFactory.createMap(entryCount * 2, valueSize);
 
-        // Pre-populate
+        // ── Pre-populate ──────────────────────────────────────────────────────
         for (int i = 0; i < entryCount; i++) {
             byte[] v = values[i % 1024];
             rmcache.put(keys[i], v);
-            nmaMap.put(keys[i], v);
+            mapDBMap.put(keys[i], v);
+            chronicleMap.put(keys[i], v);
         }
         System.out.println("--- Setup Complete ---\n");
     }
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        if (rmcache != null) {
-            rmcache.close();
-        }
-        // NMA manages cleanup via allocator
+        if (rmcache != null) rmcache.close();
+        if (mapDB != null) mapDB.close();
+        if (chronicleMap != null) chronicleMap.close();
     }
 
-    // ========== RMCache Benchmarks ==========
+    // ── RMCache ───────────────────────────────────────────────────────────────
 
     @Benchmark
     public byte[] rmcacheGet() {
@@ -108,6 +105,7 @@ public class ThroughputBenchmark {
         return rmcache.get(keys[idx]);
     }
 
+    /** Zero-copy read — no intermediate byte[] allocation. */
     @Benchmark
     public void rmcacheGetZeroCopy(Blackhole bh) {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
@@ -121,29 +119,31 @@ public class ThroughputBenchmark {
         rmcache.put(keys[idx], values[idx % 1024]);
     }
 
-    // ========== NMA Benchmarks ==========
+    // ── MapDB ─────────────────────────────────────────────────────────────────
 
     @Benchmark
-    public byte[] nmaGet() {
+    public byte[] mapdbGet() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        return nmaMap.get(keys[idx]);
+        return mapDBMap.get(keys[idx]);
     }
 
     @Benchmark
-    public void nmaPut() {
+    public void mapdbPut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
-        nmaMap.put(keys[idx], values[idx % 1024]);
+        mapDBMap.put(keys[idx], values[idx % 1024]);
     }
 
-    private static class ByteArraySerializer implements NativeMemoryMapSerializer<byte[]> {
-        @Override
-        public byte[] deserializeFromOnHeapMemoryBuffer(OnHeapMemoryBuffer onHeapMemoryBuffer) {
-            return onHeapMemoryBuffer.toTrimmedArray();
-        }
+    // ── ChronicleMap ──────────────────────────────────────────────────────────
 
-        @Override
-        public byte[] serializeToByteArray(byte[] value) {
-            return value;
-        }
+    @Benchmark
+    public byte[] chronicleGet() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return chronicleMap.get(keys[idx]);
+    }
+
+    @Benchmark
+    public void chroniclePut() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        chronicleMap.put(keys[idx], values[idx % 1024]);
     }
 }

@@ -5,7 +5,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 
 /**
- * Memory prefetching utilities for JDK 25 FFM API.
+ * Memory prefetching utilities for JDK 25+ FFM API.
  *
  * @author Rabindra Meher
  */

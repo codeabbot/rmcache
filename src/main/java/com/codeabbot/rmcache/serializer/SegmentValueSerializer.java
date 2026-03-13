@@ -13,7 +13,7 @@ public interface SegmentValueSerializer<V> extends StreamingSerializer<V> {
      * @param dest   destination segment (typically NativeMemory.UNLIMITED)
      * @param offset destination offset
      * @param maxLen maximum allowed bytes
-     * @return actual bytes written (must be <= maxLen)
+     * @return actual bytes written (must be {@literal <=} maxLen)
      */
     int serializeTo(V value, MemorySegment dest, long offset, int maxLen);
 }

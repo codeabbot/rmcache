@@ -17,6 +17,8 @@ import java.util.concurrent.locks.StampedLock;
  */
 public class OffHeapHashTable implements AutoCloseable {
 
+    private record RetiredSegment(long retiredAtNanos, MemorySegment segment) {}
+
     private final EntryPool entryPool;
     private final int numStripes;
     private final boolean enablePrefetch;
@@ -34,12 +36,16 @@ public class OffHeapHashTable implements AutoCloseable {
     private final StampedLock[] tableLocks;
     private final MemorySegment[] tableSegments;
 
-    // Async cleanup queue for retired tables — entries are timestamped for
-    // grace-period reclamation
-    private final ConcurrentLinkedQueue<Object[]> retiredSegments = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<RetiredSegment> retiredSegments = new ConcurrentLinkedQueue<>();
 
     private static final int SLOT_SIZE = 8; // 8 bytes packed: Top 32 bits Hash, Bottom 32 bits SlotID
     private static final int MAX_SAME_HASH_PROBE = 32;
+
+    // ISSUE-003: Grace period before freeing retired hash table segments.
+    // Must exceed the longest possible optimistic-read descheduling window.
+    // 2s is conservative; even under heavy GC or container throttling, OS
+    // schedulers rarely preempt a thread for >1s.
+    private static final long RETIRED_GRACE_NANOS = 2_000_000_000L;
 
     public OffHeapHashTable(EntryPool entryPool, long memoryBytes, int numStripes, boolean enablePrefetch) {
         this(entryPool, memoryBytes, numStripes, enablePrefetch, 256, 0.75d);
@@ -91,9 +97,9 @@ public class OffHeapHashTable implements AutoCloseable {
             }
         }
         // Force-drain all retired segments on close (no grace period needed)
-        Object[] entry;
+        RetiredSegment entry;
         while ((entry = retiredSegments.poll()) != null) {
-            NativeMemory.free((MemorySegment) entry[1]);
+            NativeMemory.free(entry.segment());
         }
     }
 
@@ -453,7 +459,7 @@ public class OffHeapHashTable implements AutoCloseable {
             }
         }
 
-        retiredSegments.offer(new Object[] { System.nanoTime(), tableSegments[sIdx] });
+        retiredSegments.offer(new RetiredSegment(System.nanoTime(), tableSegments[sIdx]));
         tableSegments[sIdx] = newTable;
         tableAddrs[sIdx] = newAddr;
         tableCapacities[sIdx] = newCap;
@@ -462,13 +468,13 @@ public class OffHeapHashTable implements AutoCloseable {
         // M3 fix: Inline-drain retired segments past the grace period to prevent
         // unbounded queue growth during burst resizes.
         long now = System.nanoTime();
-        long graceNanos = 500_000_000L;
-        Object[] retired;
+        long graceNanos = RETIRED_GRACE_NANOS;
+        RetiredSegment retired;
         while ((retired = retiredSegments.peek()) != null) {
-            if (now - (long) retired[0] < graceNanos)
+            if (now - retired.retiredAtNanos() < graceNanos)
                 break;
             retiredSegments.poll();
-            NativeMemory.free((MemorySegment) retired[1]);
+            NativeMemory.free(retired.segment());
         }
     }
 
@@ -483,15 +489,14 @@ public class OffHeapHashTable implements AutoCloseable {
         // Grace period: delay freeing retired tables to avoid use-after-free
         // by optimistic readers that captured a stale tableAddr before resize.
         long now = System.nanoTime();
-        long graceNanos = 500_000_000L; // 500ms
-        Object[] entry;
+        long graceNanos = RETIRED_GRACE_NANOS;
+        RetiredSegment entry;
         while ((entry = retiredSegments.peek()) != null) {
-            long retiredAt = (long) entry[0];
-            if (now - retiredAt < graceNanos) {
+            if (now - entry.retiredAtNanos() < graceNanos) {
                 break; // Not yet safe to free
             }
             retiredSegments.poll();
-            NativeMemory.free((MemorySegment) entry[1]);
+            NativeMemory.free(entry.segment());
         }
     }
 
@@ -500,7 +505,7 @@ public class OffHeapHashTable implements AutoCloseable {
             StampedLock lock = tableLocks[i];
             long stamp = lock.writeLock();
             try {
-                retiredSegments.offer(new Object[] { System.nanoTime(), tableSegments[i] });
+                retiredSegments.offer(new RetiredSegment(System.nanoTime(), tableSegments[i]));
                 int cap = tableCapacities[i];
                 MemorySegment seg = NativeMemory.calloc(cap, SLOT_SIZE);
                 tableSegments[i] = seg;

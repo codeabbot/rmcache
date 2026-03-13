@@ -84,18 +84,21 @@ public class CacheValueViewImpl implements CacheValueView {
     @Override
     public byte getByte(int offset) {
         checkValid();
+        checkBounds(offset, 1);
         return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_BYTE, valueOffset + offset);
     }
 
     @Override
     public int getInt(int offset) {
         checkValid();
+        checkBounds(offset, 4);
         return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT_UNALIGNED, valueOffset + offset);
     }
 
     @Override
     public long getLong(int offset) {
         checkValid();
+        checkBounds(offset, 8);
         return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG_UNALIGNED, valueOffset + offset);
     }
 
@@ -103,6 +106,13 @@ public class CacheValueViewImpl implements CacheValueView {
     public void close() {
         if (closed.compareAndSet(false, true)) {
             onClose.run();
+        }
+    }
+
+    private void checkBounds(int offset, int size) {
+        if (offset < 0 || offset + size > valueLen) {
+            throw new IndexOutOfBoundsException(
+                    "offset=" + offset + " size=" + size + " exceeds value length " + valueLen);
         }
     }
 

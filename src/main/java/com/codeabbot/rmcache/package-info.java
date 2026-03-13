@@ -1,5 +1,5 @@
 /**
- * RMCache — High-Performance, Billion-Scale Off-Heap Cache for Java 22+.
+ * RMCache — High-Performance, Billion-Scale Off-Heap Cache for Java 25+ (LTS).
  *
  * <p>
  * This is the primary public API package. Key entry points:

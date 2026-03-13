@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java-version: [ '22', '25' ]
+        java-version: [ '25' ]
 
     steps:
       - name: Checkout
@@ -31,6 +31,9 @@ jobs:
 
       - name: Run Tests
         run: ./gradlew test
+
+      - name: Coverage Report
+        run: ./gradlew jacocoTestReport jacocoTestCoverageVerification
 
       - name: Generate Javadoc
         run: ./gradlew javadoc

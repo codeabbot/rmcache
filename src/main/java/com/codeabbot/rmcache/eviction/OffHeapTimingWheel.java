@@ -137,7 +137,7 @@ public final class OffHeapTimingWheel implements AutoCloseable {
     /**
      * Poll up to {@code maxCount} expired slot IDs across all stripes.
      * Returns the first expired slot found, or {@code 0} if none.
-     * Lazily-cancelled entries (exp <= 0) at the heap head are drained.
+     * Lazily-cancelled entries (exp {@literal <=} 0) at the heap head are drained.
      */
     public int pollExpiredOne() {
         long now = CoarseClock.getNow();

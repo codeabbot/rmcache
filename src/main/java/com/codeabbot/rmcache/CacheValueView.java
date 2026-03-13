@@ -9,7 +9,27 @@ import java.lang.foreign.ValueLayout;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Zero-copy view into a cached value.
+ * Zero-copy view into a cached value's off-heap memory.
+ *
+ * <p><b>EXPERIMENTAL — Use-after-free risk.</b> This view holds a raw pointer
+ * into off-heap memory. If the underlying entry is evicted, removed, or
+ * reallocated (e.g., value resize) while the view is open, reads through
+ * this view may return corrupt data or crash the JVM (SIGSEGV).
+ *
+ * <p><b>Safe usage pattern:</b>
+ * <pre>{@code
+ * try (CacheValueView view = cache.getView(key)) {
+ *     if (view != null && view.isValid()) {
+ *         byte[] data = view.toByteArray(); // copy immediately
+ *     }
+ * }
+ * // Do NOT store the view or pass it to another thread.
+ * }</pre>
+ *
+ * <p>The {@link #isValid()} check detects eviction that occurred <i>before</i>
+ * the call, but cannot guard against concurrent eviction <i>during</i> a read.
+ * For absolute safety, use {@link OffHeapCache#get(Object)} which copies the
+ * value to the Java heap.
  *
  * @author Rabindra Meher
  */

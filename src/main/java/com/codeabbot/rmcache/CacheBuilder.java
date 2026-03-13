@@ -10,6 +10,7 @@ import com.codeabbot.rmcache.serializer.*;
 import com.codeabbot.rmcache.util.MemoryEstimator;
 
 import java.time.Duration;
+import java.util.concurrent.Executor;
 
 /**
  * Builder for creating OffHeapCache instances.
@@ -42,6 +43,8 @@ public class CacheBuilder<K, V> {
     private EvictionListener<K, V> evictionListener = null;
     private EvictionFilter<K> evictionFilter = null;
     private boolean zeroMemory = false;
+
+    private Executor asyncExecutor = null;
 
     private String cacheName = "rmcache";
 
@@ -113,6 +116,42 @@ public class CacheBuilder<K, V> {
         return this;
     }
 
+    /**
+     * Configure the cache for minimal Java heap impact.
+     *
+     * <p>This preset makes two changes:
+     * <ol>
+     *   <li>Forces {@link GhostCacheMode#OFF_HEAP} — the ghost cache L1 is stored in native
+     *       memory instead of a Java {@code Entry[]} array, eliminating heap pressure from
+     *       that structure.</li>
+     *   <li>Enables background eviction — eviction runs on a dedicated daemon thread,
+     *       keeping the hot path free of synchronous eviction work.</li>
+     * </ol>
+     *
+     * <h4>What this eliminates from the heap</h4>
+     * <ul>
+     *   <li>Ghost cache {@code Entry[]} objects (~40 bytes/entry × ghostCacheSize)</li>
+     *   <li>Synchronous eviction latency spikes on the calling thread</li>
+     * </ul>
+     *
+     * <h4>What this does NOT eliminate from the heap</h4>
+     * <ul>
+     *   <li><b>Key serialization byte[]</b> — created transiently during {@code put}/{@code get}
+     *       to serialize the key. Released promptly (no pooling, no long-term retention).</li>
+     *   <li><b>Value copy byte[]</b> — returned to the caller by {@code get()}. Required by
+     *       the JVM type system; use {@link OffHeapCache#getZeroCopy} or
+     *       {@link OffHeapCache#getView} to avoid this allocation.</li>
+     *   <li><b>Control-plane objects</b> — locks, counters, executors (~1.5 MB fixed overhead).
+     *       These are small and static; they do not grow with entry count.</li>
+     *   <li><b>Per-thread key buffers</b> — {@code ThreadLocalKeyBuffer} (4–256 KB per thread)
+     *       for Latin-1 key encoding. Call {@link OffHeapCache#cleanupThreadLocals()} on
+     *       thread retirement to reclaim these.</li>
+     * </ul>
+     *
+     * <p><b>Steady-state heap footprint</b> (after JIT warmup, no pending GC): approximately
+     * {@code ~1.5 MB (fixed) + ~260 KB × activeThreads}. All key/value data, LRU structures,
+     * hash table arrays, and frequency sketch live entirely in native memory.
+     */
     public CacheBuilder<K, V> zeroHeapProfile() {
         this.zeroHeapProfile = true;
         this.ghostCacheMode = GhostCacheMode.AUTO;
@@ -198,6 +237,17 @@ public class CacheBuilder<K, V> {
 
     public CacheBuilder<K, V> withCacheName(String name) {
         this.cacheName = name;
+        return this;
+    }
+
+    /**
+     * Set a custom Executor for {@code putAsync}/{@code getAsync} operations.
+     * If not set, the common ForkJoinPool is used (unbounded submission queue).
+     *
+     * @param executor the executor to use for async cache operations
+     */
+    public CacheBuilder<K, V> asyncExecutor(Executor executor) {
+        this.asyncExecutor = executor;
         return this;
     }
 
@@ -312,6 +362,7 @@ public class CacheBuilder<K, V> {
             OffHeapCacheImpl<K, V> cache = new OffHeapCacheImpl<>(
                     kSer, vSer, allocator, entryPool, hashTable, policy,
                     evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
+                    asyncExecutor,
                     backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark);
             return cache;
         } catch (Throwable t) {

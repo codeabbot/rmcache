@@ -11,4 +11,5 @@ plugins {
 }
 
 rootProject.name = 'rmcache-java'
+include 'examples'
 

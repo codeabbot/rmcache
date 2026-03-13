@@ -2,6 +2,7 @@ plugins {
     alias(libs.plugins.jmh)
     id 'java-library'
     id 'maven-publish'
+    id 'jacoco'
 }
 
 group = "com.codeabbot"
@@ -9,7 +10,7 @@ version = "1.0.0"
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(22)
+        languageVersion = JavaLanguageVersion.of(25)
     }
     withSourcesJar()
     withJavadocJar()
@@ -23,13 +24,13 @@ dependencies {
     implementation libs.slf4j.api
 
     testImplementation libs.bundles.testing
-    testImplementation libs.nma
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    
+
     jmh libs.jmh.core
     jmh libs.jmh.annproc
     jmh libs.caffeine
-    jmh libs.nma
+    jmh libs.mapdb
+    jmh libs.chronicle.map
     jmh "org.ehcache:ehcache:3.10.8"
 }
 
@@ -42,15 +43,76 @@ tasks.withType(Test).configureEach {
     }
 }
 
+// ─── JaCoCo ──────────────────────────────────────────────────────────────────
+
+jacoco {
+    toolVersion = "0.8.13"
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = true
+    }
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: [
+                '**/benchmark/**',
+                '**/package-info.class',
+                '**/module-info.class'
+            ])
+        }))
+    }
+}
+
+jacocoTestCoverageVerification {
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: [
+                '**/benchmark/**',
+                '**/package-info.class',
+                '**/module-info.class'
+            ])
+        }))
+    }
+    violationRules {
+        rule {
+            limit {
+                minimum = 0.65
+            }
+        }
+    }
+}
+
+test.finalizedBy(jacocoTestReport)
+
+// ─── JMH ─────────────────────────────────────────────────────────────────────
+
 jmh {
     includes = [project.findProperty("jmh.includes")?.toString() ?: "ComparativeWorkloadBenchmark"]
     iterations = project.findProperty("jmh.iterations")?.toString()?.toInteger() ?: 2
     warmupIterations = project.findProperty("jmh.warmupIterations")?.toString()?.toInteger() ?: 1
     fork = 1
     threads = project.findProperty("jmh.threads")?.toString()?.toInteger() ?: 4
-    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Xmx8g", "-XX:+UseG1GC"]
+    jvmArgs = [
+        "--enable-native-access=ALL-UNNAMED",
+        "-Xmx8g",
+        "-XX:+UseG1GC",
+        // Required by MapDB and ChronicleMap on JDK 25
+        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.util=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/java.util=ALL-UNNAMED"
+    ]
     resultFormat = "text"
 }
+
+// ─── Publishing ──────────────────────────────────────────────────────────────
 
 publishing {
     publications {
@@ -58,7 +120,7 @@ publishing {
             from components.java
             pom {
                 name = "RMCache"
-                description = "High-performance billion-scale off-heap cache for JVM (JDK 25+)"
+                description = "High-performance billion-scale off-heap cache for JVM — requires JDK 25+ (LTS)"
                 url = "https://github.com/codeabbot/rmcache"
                 licenses {
                     license {
@@ -83,18 +145,23 @@ publishing {
     }
 }
 
-tasks.register('runMemoryBenchmark', JavaExec) {
-    group = "benchmark"
-    description = "Runs the Memory Comparison Benchmark"
-    classpath = sourceSets.jmh.runtimeClasspath
-    mainClass = "com.codeabbot.rmcache.benchmark.MemoryBenchmarkRunner"
-    jvmArgs("--enable-native-access=ALL-UNNAMED", "-Xmx8g")
-}
+// ─── Custom tasks ────────────────────────────────────────────────────────────
 
 tasks.register('runMemoryScalability', JavaExec) {
     group = "benchmark"
-    description = "Runs the Memory Scalability Suite (10k-1M + 1B Projection)"
+    description = "Runs the Memory Scalability Suite (10k / 100k / 1M + 1B Projection)"
     classpath = sourceSets.jmh.runtimeClasspath
     mainClass = "com.codeabbot.rmcache.benchmark.MemoryScalabilitySuite"
-    jvmArgs("--enable-native-access=ALL-UNNAMED", "-Xmx8g")
+    jvmArgs(
+        "--enable-native-access=ALL-UNNAMED",
+        "-Xmx8g",
+        "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.ref=ALL-UNNAMED",
+        "--add-exports=java.base/jdk.internal.util=ALL-UNNAMED",
+        "--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
+        "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED",
+        "--add-opens=java.base/java.io=ALL-UNNAMED",
+        "--add-opens=java.base/java.util=ALL-UNNAMED"
+    )
 }

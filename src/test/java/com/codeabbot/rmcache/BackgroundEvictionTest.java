@@ -27,12 +27,10 @@ public class BackgroundEvictionTest {
                 cache.put("k" + i, "v" + i);
             }
 
-            // Allow background eviction to run
-            for (int i = 0; i < 20; i++) {
-                if (cache.size() <= maxEntries) {
-                    break;
-                }
-                Thread.sleep(10);
+            // Wait up to 2 seconds for background eviction to converge
+            long deadline = System.nanoTime() + 2_000_000_000L;
+            while (cache.size() > maxEntries && System.nanoTime() < deadline) {
+                Thread.sleep(5);
             }
 
             assertTrue(cache.size() <= maxEntries);

@@ -9,7 +9,8 @@ assertj = "3.26.3"
 mockito = "5.14.2"
 jmh = "1.37"
 caffeine = "3.1.8"
-nma = "3.0.10"
+mapdb = "3.0.9"
+chronicleMap = "2026.1"
 
 [libraries]
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
@@ -26,7 +27,8 @@ mockito-junit-jupiter = { module = "org.mockito:mockito-junit-jupiter", version.
 jmh-core = { module = "org.openjdk.jmh:jmh-core", version.ref = "jmh" }
 jmh-annproc = { module = "org.openjdk.jmh:jmh-generator-annprocess", version.ref = "jmh" }
 caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
-nma = { module = "com.target:native-memory-allocator", version.ref = "nma" }
+mapdb = { module = "org.mapdb:mapdb", version.ref = "mapdb" }
+chronicle-map = { module = "net.openhft:chronicle-map", version.ref = "chronicleMap" }
 
 [bundles]
 testing = ["jupiter-api", "jupiter-engine", "jupiter-params", "assertj-core", "mockito-core", "mockito-junit-jupiter", "logback-classic"]
