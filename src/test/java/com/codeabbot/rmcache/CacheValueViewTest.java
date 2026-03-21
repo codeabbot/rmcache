@@ -105,16 +105,31 @@ public class CacheValueViewTest {
 
     @Test
     public void testGetViewSliceReturnsPartialData() {
-        // CacheValueView interface in Java might not have slice exposed if it was
-        // Kotlin extension or implementation specific
-        // checking CacheValueView definition... Assuming strict interface compliance.
-        // It seems `slice` was not in the interface I reviewed earlier?
-        // Let's check CacheValueView.java again before implementing this test if
-        // unsure.
-        // For now I will skip slice test if not sure, but let's assume it exists or
-        // equivalent.
-        // Wait, looking at CacheValueViewImpl.java (impl) it might have it.
-        // But let's stick to public API.
+        cache = createCache();
+        String key = "sliceKey";
+        byte[] value = { 10, 20, 30, 40, 50, 60, 70, 80 };
+
+        cache.put(key, value);
+
+        try (CacheValueView view = cache.getView(key)) {
+            assertNotNull(view);
+
+            // Slice from offset 2, length 3 -> should return {30, 40, 50}
+            byte[] partial = view.slice(2, 3);
+            assertArrayEquals(new byte[] { 30, 40, 50 }, partial);
+
+            // Slice from offset 0, length 1 -> should return {10}
+            byte[] first = view.slice(0, 1);
+            assertArrayEquals(new byte[] { 10 }, first);
+
+            // Slice the entire value
+            byte[] full = view.slice(0, value.length);
+            assertArrayEquals(value, full);
+
+            // Empty slice
+            byte[] empty = view.slice(0, 0);
+            assertEquals(0, empty.length);
+        }
     }
 
     @Test
@@ -127,10 +142,11 @@ public class CacheValueViewTest {
 
         try (CacheValueView view = cache.getView(key)) {
             assertNotNull(view);
-            // Assuming getByte exists or via MemorySegment
-            // The previous Kotlin test used `view.getByte(index)`.
-            // I should verify if CacheValueView has `getByte`.
-            // If not, I'll rely on toByteArray() for now.
+            assertEquals((byte) 10, view.getByte(0));
+            assertEquals((byte) 20, view.getByte(1));
+            assertEquals((byte) 30, view.getByte(2));
+            assertEquals((byte) 40, view.getByte(3));
+            assertEquals((byte) 50, view.getByte(4));
         }
     }
 
