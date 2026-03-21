@@ -72,7 +72,7 @@ cache.put("permanent", data);  // no TTL
 
 ### TTL Precision
 
-TTL expiration has ±100 ms granularity due to `CoarseClock`. This is by design — checking `System.currentTimeMillis()` on every `get()` is 5-10× more expensive than a volatile read of the coarse clock. If you need millisecond-precise TTL, use a lower-overhead external scheduler.
+TTL expiration has ±50 ms granularity due to `CoarseClock`. This is by design — checking `System.currentTimeMillis()` on every `get()` is 5-10× more expensive than a volatile read of the coarse clock. If you need millisecond-precise TTL, use a lower-overhead external scheduler.
 
 ---
 
@@ -85,7 +85,7 @@ import com.codeabbot.rmcache.eviction.CompositePolicy;
 
 LRUPolicy lru = new LRUPolicy(maxEntries);
 TTLPolicy ttl = new TTLPolicy(Duration.ofMinutes(30).toMillis(), entryPool);
-CompositePolicy policy = new CompositePolicy(lru, ttl);
+CompositePolicy policy = new CompositePolicy(List.of(lru, ttl));
 
 OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .eviction(policy)

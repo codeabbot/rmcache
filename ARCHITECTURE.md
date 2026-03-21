@@ -285,7 +285,7 @@ All threads are daemon threads and do not prevent JVM shutdown.
 
 | Thread Name | Purpose | Interval |
 |-------------|---------|----------|
-| `rmcache-coarse-clock` | Updates `CoarseClock.now` for TTL reads | 100 ms |
+| `rmcache-coarse-clock` | Updates `CoarseClock.now` for TTL reads | 50 ms |
 | `rmcache-maintenance` | Hash table cleanup queue drain (retired segments) | 1 s |
 | `rmcache-lru-maintenance` | LRU buffer drain + frequency sketch reset + eviction check | 10 ms |
 | `rmcache-eviction` | Async eviction processing (background eviction mode) | on-demand |
@@ -303,7 +303,7 @@ All threads are daemon threads and do not prevent JVM shutdown.
 | Packed 64-bit allocation handles | Encodes offset + size class in one `long`; eliminates `AllocationHandle` heap objects |
 | Slab + Buddy hybrid | Slabs for O(1) fixed-size alloc; buddy for rare large allocs with O(log N) coalescing |
 | Thread-local key buffers | Eliminates `byte[]` per key serialization on the Latin-1 hot path |
-| Coarse clock (100 ms) | Avoids `System.currentTimeMillis()` syscall on every TTL check; ±100ms TTL precision is acceptable |
+| Coarse clock (50 ms) | Avoids `System.currentTimeMillis()` syscall on every TTL check; ±50ms TTL precision is acceptable |
 | Sharded LRU (up to 64 shards) | Eliminates single-lock bottleneck; round-robin victim selection distributes eviction evenly |
 | Murmur-style hash spread | `h ^= h>>>16; h *= 0x85ebca6b; h ^= h>>>13` applied at all 5 hash computation sites; prevents clustering on low-entropy keys |
 | Entry header alignment | `expiresAt` at offset 8 (8-byte aligned) enables `ValueLayout.JAVA_LONG` — 17–37% faster than unaligned reads |
@@ -371,7 +371,7 @@ Heap ≈ FixedOverhead (~1.5 MB)
 ### Utilities
 | File | Description |
 |------|-------------|
-| `CoarseClock.java` | Reference-counted ~100 ms-granularity clock |
+| `CoarseClock.java` | Reference-counted ~50 ms-granularity clock |
 | `ThreadLocalKeyBuffer.java` | Zero-allocation Latin-1 key encoding with thread-local cleanup |
 | `Prefetch.java` | CPU cache prefetching via FFM |
 | `MemoryEstimator.java` | Off-heap memory budgeting and index sizing |

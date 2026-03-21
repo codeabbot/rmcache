@@ -2,7 +2,7 @@
 
 RMCache is an off-heap cache for JVM applications. It stores all key/value data in native memory using the Java FFM API, eliminating GC pressure even when managing gigabytes of data.
 
-**Requirements:** JDK 25+ (LTS), Gradle 8+ or Maven 3.9+
+**Requirements:** JDK 25+ (LTS), Gradle 8+
 
 ---
 
@@ -14,16 +14,6 @@ RMCache is an off-heap cache for JVM applications. It stores all key/value data 
 dependencies {
     implementation 'com.codeabbot:rmcache:1.0.0'
 }
-```
-
-### Maven
-
-```xml
-<dependency>
-    <groupId>com.codeabbot</groupId>
-    <artifactId>rmcache</artifactId>
-    <version>1.0.0</version>
-</dependency>
 ```
 
 ### JVM Flags

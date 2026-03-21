@@ -1,6 +1,6 @@
 # RMCache User Manual
 
-RMCache is a high-performance, strictly off-heap caching library for Java 22+. It is designed for billion-scale entry sets, providing sub-microsecond latency while keeping the GC completely unburdened. 
+RMCache is a high-performance, strictly off-heap caching library for Java 25+. It is designed for billion-scale entry sets, providing sub-microsecond latency while keeping the GC completely unburdened. 
 
 This manual covers everything from basic usage to advanced tuning.
 
@@ -52,7 +52,7 @@ The `CacheBuilder` provides extensive options to tune memory and concurrency.
 
 - `maxEntries(int)`: The absolute maximum number of items the cache will track before evicting.
 - `offHeapMemory(long)`: Total byte capacity of the native slab region. Ensure this is larger than your expected `maxEntries * (avgKey + avgVal + overhead)`.
-- `slabSize(int)`: Size of memory pages (default: 64KB). Values > 1MB use the Buddy Allocator.
+- `slabSize(int)`: Size of memory pages (default: 64KB). Values > 64KB use the Buddy Allocator.
 - `averageKeySize(int)` and `averageValueSize(int)`: Used by the internal memory estimator.
 
 ### Concurrency
@@ -159,7 +159,7 @@ cache.put("session:1", tokenBytes, Duration.ofMinutes(30));
 You can mix LRU and TTL using `CompositePolicy`.
 
 ```java
-.eviction(new CompositePolicy(slru, ttl))
+.eviction(new CompositePolicy(List.of(slru, ttl)))
 ```
 
 ### Eviction Listeners & Filters

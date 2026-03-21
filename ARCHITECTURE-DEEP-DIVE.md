@@ -92,7 +92,7 @@ cache.close();
 .eviction(new TTLPolicy(Duration.ofMinutes(5).toMillis(), entryPool))
 
 // Combined LRU + TTL
-.eviction(new CompositePolicy(lruPolicy, ttlPolicy))
+.eviction(new CompositePolicy(List.of(lruPolicy, ttlPolicy)))
 
 // No eviction (manual management / bounded by off-heap memory only)
 .eviction(new NoEvictionPolicy())
@@ -269,6 +269,6 @@ Safe to call from any thread, even if it never accessed the cache.
 | `OutOfMemoryError: Java heap space` | Too many threads × 260 KB per-thread buffers | Increase `-Xmx` or call `cleanupThreadLocals()` after request |
 | Long GC pauses | Large on-heap ghost cache (`HEAP` mode) | Use `GhostCacheMode.OFF_HEAP` or `zeroHeapProfile()` |
 | `IllegalArgumentException` at build | Invalid configuration (negative sizes, non-power-of-2 partitions) | Check `maxEntries > 0`, partitions are power-of-2 |
-| Stale reads after TTL expiry | `CoarseClock` has ±100 ms granularity by design | TTL precision is ±100 ms; set TTL accordingly |
+| Stale reads after TTL expiry | `CoarseClock` has ±50 ms granularity by design | TTL precision is ±50 ms; set TTL accordingly |
 | Memory not freed after `clear()` | Background eviction still running | Call `close()` to release all native memory |
 | Slow `clear()` at scale | O(slotCapacity) iteration | Call from maintenance thread, not hot path |
