@@ -68,7 +68,9 @@ public class CacheValueViewImpl implements CacheValueView {
     @Override
     public byte[] slice(int offset, int length) {
         checkValid();
-        if (offset < 0 || length < 0 || offset + length > valueLen) {
+        // AUDIT-C4: Use long arithmetic to prevent int overflow bypass.
+        // offset + length can wrap negative when both are large positive ints.
+        if (offset < 0 || length < 0 || (long) offset + length > valueLen) {
             throw new IllegalArgumentException("Slice exceeds value bounds");
         }
         byte[] bytes = new byte[length];
@@ -110,7 +112,8 @@ public class CacheValueViewImpl implements CacheValueView {
     }
 
     private void checkBounds(int offset, int size) {
-        if (offset < 0 || offset + size > valueLen) {
+        // AUDIT-C4: Use long arithmetic to prevent int overflow bypass.
+        if (offset < 0 || (long) offset + size > valueLen) {
             throw new IndexOutOfBoundsException(
                     "offset=" + offset + " size=" + size + " exceeds value length " + valueLen);
         }

@@ -433,7 +433,12 @@ public class OffHeapHashTable implements AutoCloseable {
                 int dist = 0;
                 long currEntry = oldEntry;
 
-                while (true) {
+                // AUDIT-M9: Cap probe distance during resize to newCap to prevent
+                // infinite loop on pathological hash collisions. Robin Hood ensures
+                // entries spread out, but with >32 same-hash keys the get() probe
+                // limit (MAX_SAME_HASH_PROBE=32) makes entries beyond 32 invisible
+                // after resize. This cap bounds the loop without dropping entries.
+                while (dist < newCap) {
                     long newEntryAddr = newAddr + ((long) idx << 3);
                     long existingEntry = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, newEntryAddr);
 

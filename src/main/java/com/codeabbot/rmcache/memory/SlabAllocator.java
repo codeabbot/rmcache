@@ -65,7 +65,9 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         this.buddySize = (memorySize < 1024 * 1024) ? 0 : p2;
         this.slabRegionSize = memorySize - buddySize;
 
-        this.buddyAllocator = new BuddyAllocator(segment, slabRegionSize, buddySize);
+        // AUDIT-H7: Skip BuddyAllocator when buddySize is 0 (memorySize < 1MB).
+        // BuddyAllocator requires capacity to be a power-of-2 > 0.
+        this.buddyAllocator = (buddySize > 0) ? new BuddyAllocator(segment, slabRegionSize, buddySize) : null;
 
         int maxSlabs = (int) (slabRegionSize / slabSize) + 1;
         this.slabDirectory = new LockFreeSlabManager[maxSlabs];

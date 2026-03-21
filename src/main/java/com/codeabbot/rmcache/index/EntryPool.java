@@ -48,7 +48,11 @@ public class EntryPool implements AutoCloseable {
     }
 
     static int unpackSC(long packed) {
-        return (int) ((packed >>> 48) & 0xFF);
+        // AUDIT-C2: The pack side stores (sizeClass & 0xFF) in bits 48-55.
+        // For large allocations (buddy), sizeClass is -1, stored as 0xFF.
+        // We must map 0xFF back to -1 to avoid SIZE_CLASSES[255] AIOOBE.
+        int sc = (int) ((packed >>> 48) & 0xFF);
+        return (sc == 0xFF) ? -1 : sc;
     }
 
     public EntryPool(SlabAllocator allocator, int maxEntries, int numPartitions) {
@@ -259,6 +263,17 @@ public class EntryPool implements AutoCloseable {
         }
     }
 
+    /**
+     * AUDIT-H1: Update the expiration time for a slot.
+     * Called on in-place value updates to ensure TTL is refreshed.
+     */
+    public void setExpiresAt(int slot, long expiresAtMillis) {
+        long offset = getOffset(slot);
+        if (offset != -1L) {
+            NativeMemory.UNLIMITED.set(ValueLayout.JAVA_LONG, offset + 8, expiresAtMillis);
+        }
+    }
+
     public boolean isExpired(int slot) {
         long e = getExpiresAt(slot);
         return e > 0 && CoarseClock.getNow() >= e;
@@ -299,7 +314,18 @@ public class EntryPool implements AutoCloseable {
 
     public boolean updateValueWithLen(int slot, byte[] valueBytes, int valueLen) {
         int pIdx = slot >>> partitionShift;
-        return partitions[pIdx].updateValue(slot, valueBytes, valueLen);
+        return partitions[pIdx].updateValue(slot, valueBytes, valueLen, 0);
+    }
+
+    /**
+     * AUDIT-C1: Update value with key-hash verification. If expectedKeyHash != 0,
+     * the update is rejected if the stored key hash does not match. This catches
+     * the ghost-cache TOCTOU race where a slot is freed and reallocated to a
+     * different key between the ghost lookup and the updateValue call.
+     */
+    public boolean updateValueWithLen(int slot, byte[] valueBytes, int valueLen, int expectedKeyHash) {
+        int pIdx = slot >>> partitionShift;
+        return partitions[pIdx].updateValue(slot, valueBytes, valueLen, expectedKeyHash);
     }
 
     public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer) {
@@ -581,13 +607,21 @@ public class EntryPool implements AutoCloseable {
         // fast path allowed two concurrent threads to interleave value byte writes
         // for the same slot, causing torn reads. The volatile offset re-check only
         // caught reallocation races, not same-offset concurrent writes.
-        public boolean updateValue(int slot, byte[] valueBytes, int valueLen) {
+        public boolean updateValue(int slot, byte[] valueBytes, int valueLen, int expectedKeyHash) {
             lock.lock();
             try {
                 long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
                 if (packed == -1L)
                     return false;
                 long absOffset = unpackAddr(packed);
+                // AUDIT-C1: Key-hash guard. If expectedKeyHash != 0, verify the
+                // entry's stored key hash matches. Catches ghost-cache TOCTOU race
+                // where slot was freed and reallocated to a different key.
+                if (expectedKeyHash != 0) {
+                    int storedHash = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset);
+                    if (storedHash != expectedKeyHash)
+                        return false;
+                }
                 int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
                 int sc = unpackSC(packed);
                 int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;

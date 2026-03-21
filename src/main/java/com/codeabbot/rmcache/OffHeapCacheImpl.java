@@ -321,11 +321,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         CacheContext ctx = context.get();
 
         int existingSlot = 0;
-        if (hasOffHeapGhostCache) {
-            existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-        }
         byte[] keyBytes = null;
         int keyLen = 0;
+        if (hasOffHeapGhostCache) {
+            // AUDIT-C1: Ghost cache's getSlot() does matchesAt() (full key compare).
+            // The remaining TOCTOU is slot freed+reallocated between getSlot and
+            // updateValue. This is caught by the key-hash guard inside updateValue
+            // (see AUDIT-C1 in EntryPool.SubPool.updateValue) — one off-heap int
+            // read under the SubPool lock, zero-cost on the common case.
+            existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+        }
         if (existingSlot == 0) {
             if (useKeyMatchFastPath) {
                 existingSlot = hashTable.getWithKey(keyHash, key, keySerializer);
@@ -375,11 +380,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             if (putIfAbsent)
                 return false;
 
+            // AUDIT-C1: Pass keyHash for key-hash guard inside updateValue.
+            // This catches ghost-cache TOCTOU where slot was reallocated to
+            // a different key — one off-heap int read under the SubPool lock.
             boolean updated = (segSer != null)
                     ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value)
-                    : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen);
+                    : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen, keyHash);
 
             if (updated) {
+                // AUDIT-H1: Update TTL on in-place value update only when caller
+                // specified a TTL. put(key, value) without TTL preserves existing
+                // expiration — clearing it would be a surprising behavior change.
+                if (ttl != null) {
+                    entryPool.setExpiresAt(existingSlot, expiresAtMillis);
+                }
                 evictionPolicy.onAccess(existingSlot, keyHash);
                 // Skip ghost cache bookkeeping on updates — slot already tracked
                 return true;
@@ -1034,23 +1048,48 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         int slot = 0;
-        if (offHeapGhostCache != null) {
-            slot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
-        }
-
         byte[] keyBytes = null;
         int keyLen = 0;
+        if (offHeapGhostCache != null) {
+            // AUDIT-H2: Re-validate ghost cache hit via hash table (same as getZeroCopy).
+            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            if (ghostSlot != 0) {
+                int confirmedSlot;
+                if (useKeyMatchFastPath) {
+                    confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
+                } else {
+                    if (isLatin1Key && key instanceof String s) {
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
+                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+                }
+                if (confirmedSlot == ghostSlot) {
+                    slot = ghostSlot;
+                } else {
+                    offHeapGhostCache.invalidate(keyHash);
+                    slot = confirmedSlot;
+                }
+            }
+        }
+
         if (slot == 0) {
             if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
-                if (isLatin1Key && key instanceof String s) {
-                    ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
-                    keyBytes = res.buffer();
-                    keyLen = res.length();
-                } else {
-                    keyBytes = keySerializer.serialize(key);
-                    keyLen = keyBytes.length;
+                if (keyBytes == null) {
+                    if (isLatin1Key && key instanceof String s) {
+                        ThreadLocalKeyBuffer.BufferResult res = ThreadLocalKeyBuffer.encodeString(s);
+                        keyBytes = res.buffer();
+                        keyLen = res.length();
+                    } else {
+                        keyBytes = keySerializer.serialize(key);
+                        keyLen = keyBytes.length;
+                    }
                 }
                 slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
