@@ -15,3 +15,7 @@ lib
 .vscode
 .agent
 .agent/*
+*.bak
+*.iml
+*.log
+local.properties
