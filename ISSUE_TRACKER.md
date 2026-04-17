@@ -334,3 +334,23 @@ Priority order designed to minimize perf risk (safe fixes first, risky fixes lat
 | 2026-03-12 | ISSUE-017 | Header field alignment (expiresAt → offset+8) | GET 10K=112ns 100K=308ns 1M=491ns / PUT 10K=182ns 100K=353ns 1M=473ns | RESOLVED — **17-37% improvement** |
 | 2026-03-12 | ISSUE-014 | Single-attempt CAS frequency sketch | GET 10K=123ns 100K=290ns 1M=503ns / PUT 10K=148ns 100K=299ns 1M=466ns | RESOLVED — no regression |
 | 2026-03-12 | ISSUE-020 | JDK 22 compat (moot — dropped) | N/A | RESOLVED (moot) |
+
+---
+
+## Audit Remediation (IMPLEMENTATION_AUDIT.md)
+
+Second-pass audit (2026-03-22) surfaced 8 additional correctness concerns on top of the 22 original issues. All resolved 2026-04-17 across three commits; JMH re-run per commit against the day-of baseline (pre-remediation JMH: RMCache GET 10K=121.6ns 100K=355.0ns 1M=549.8ns / PUT 10K=265.6ns 100K=395.3ns 1M=582.9ns).
+
+| Date | Commit | Audit findings | JMH Result vs same-day baseline | Status |
+|------|--------|----------------|--------------------------------|--------|
+| 2026-04-17 | `ab749e9` | A8 (dead builder API), A7 (fabricated EntryMetadata fields), A6 (incomplete cleanupThreadLocals), A1 (silent STRING_VALUE fallback), A4 (free-before-publish UAF in updateValue) | GET 10K=133ns(±60) 100K=367ns(±114) 1M=552ns(±173) / PUT 10K=222ns(±467) 100K=353ns(±301) 1M=558ns(±111) | RESOLVED — 9/12 improved, 3 flat, 0 regress beyond 1σ |
+| 2026-04-17 | `02a0e9b` | A3 (stale-slot guard on serializer/writer update paths), A2 (TTLPolicy.defaultTTLMs unused), A5 (in-place setExpiresAt breaks wheel order) | GET 10K=124ns(±38) 100K=333ns(±65) 1M=517ns(±150) / PUT 10K=215ns(±453) 100K=419ns(±89) 1M=531ns(±93) | RESOLVED — 6 improved, 5 flat, 0 regress |
+| 2026-04-17 | `08a0e15` | Targeted tests for A3/A2/A5 (5 new tests; 581/581 pass) | GET 10K=123ns(±46) 100K=315ns(±12) 1M=515ns(±23) / PUT 10K=214ns(±159) 100K=384ns(±243) 1M=546ns(±48) | RESOLVED — 0 regress (test sources don't affect main compile) |
+
+Cumulative effect on `FairComparisonScaleBenchmark`:
+- **RMCache GET (plain)**: 122ns / 315ns / 515ns at 10K / 100K / 1M — flat-to-improved vs pre-remediation
+- **RMCache PUT (plain)**: 214ns / 384ns / 546ns — 100K and 10K improved substantially
+- **RMCache GET (ghost)**: 142ns / 321ns / 522ns — tighter error bars at every scale
+- **RMCache PUT (ghost)**: 182ns / 350ns / 556ns — PUT 10K / 100K / 1M all improved vs baseline
+
+See `IMPLEMENTATION_AUDIT.md` for the Status (2026-04-17) table mapping each finding to its commit, and `build/jmh-runs/phase{1,2}_comparison.md` for per-metric deltas.
