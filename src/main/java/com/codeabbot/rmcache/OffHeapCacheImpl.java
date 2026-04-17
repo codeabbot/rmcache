@@ -107,14 +107,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     private volatile boolean closed = false;
 
-    private final ThreadLocal<CacheContext> context = ThreadLocal.withInitial(CacheContext::new);
+    // AUDIT-A6: static ThreadLocal so cleanupThreadLocals() can release the
+    // per-thread value buffer regardless of which cache instance is holding
+    // a reference. The buffer is generic scratch space (serialize/deserialize)
+    // and carries no cache-instance state, so sharing across caches is safe.
+    private static final ThreadLocal<CacheContext> context = ThreadLocal.withInitial(CacheContext::new);
 
     /**
-     * ISSUE-007: Release thread-local buffers for the calling thread.
-     * Called via {@link OffHeapCache#cleanupThreadLocals()}.
+     * ISSUE-007 + AUDIT-A6: Release thread-local buffers for the calling thread.
+     * Called via {@link OffHeapCache#cleanupThreadLocals()}. Clears both the
+     * key-encoding buffer and the per-thread value scratch buffer.
      */
     static void removeThreadLocals() {
         ThreadLocalKeyBuffer.cleanup();
+        context.remove();
     }
 
     /**
@@ -158,6 +164,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final AtomicBoolean evictionUrgent = new AtomicBoolean(false);
     private ScheduledExecutorService evictionExecutor;
 
+    private final String cacheName;
+
     public OffHeapCacheImpl(
             KeySerializer<K> keySerializer,
             ValueSerializer<V> valueSerializer,
@@ -173,7 +181,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             boolean backgroundEviction,
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
-            double evictionLowWatermark) {
+            double evictionLowWatermark,
+            String cacheName) {
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init start");
         }
@@ -212,6 +221,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.backgroundEvictionIntervalMs = Math.max(1, backgroundEvictionIntervalMs);
         this.evictionHighWatermark = evictionHighWatermark;
         this.evictionLowWatermark = evictionLowWatermark;
+        this.cacheName = (cacheName == null || cacheName.isEmpty()) ? "rmcache" : cacheName;
 
         maintenanceExecutor.scheduleWithFixedDelay(() -> {
             try {
@@ -834,6 +844,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 evictionsByExplicit.sum());
     }
 
+    @Override
+    public String getCacheName() {
+        return cacheName;
+    }
+
+    @Override
+    public String toString() {
+        return "OffHeapCache[" + cacheName + ", size=" + size() + "]";
+    }
+
     private void removeInternal(int keyHash, byte[] keyBytes, int keyLen, int slot, EvictionCause cause) {
         if (ghostCache != null)
             ghostCache.invalidate(keyHash);
@@ -944,18 +964,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         @Override
-        public int getCreatedAtSeconds() {
-            return 0;
-        }
-
-        @Override
         public int getExpiresAtSeconds() {
             return (int) (entryPool.getExpiresAt(slot) / 1000);
-        }
-
-        @Override
-        public long getAgeMillis() {
-            return 0;
         }
 
         @Override

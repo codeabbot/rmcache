@@ -182,6 +182,12 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
     /** Get cache statistics. */
     CacheStats getStats();
 
+    /**
+     * Cache instance name — supplied via {@link CacheBuilder#withCacheName(String)}.
+     * Used for logging and {@code toString}; has no effect on cache behavior.
+     */
+    String getCacheName();
+
     @Override
     void close();
 

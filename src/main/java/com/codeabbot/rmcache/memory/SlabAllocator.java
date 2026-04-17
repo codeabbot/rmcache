@@ -63,6 +63,10 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
     }
 
     public SlabAllocator(long memorySize, int slabSize) {
+        this(memorySize, slabSize, false);
+    }
+
+    public SlabAllocator(long memorySize, int slabSize, boolean zeroMemoryOnStartup) {
         if (memorySize <= 0) {
             throw new IllegalArgumentException("Memory size must be > 0");
         }
@@ -70,6 +74,11 @@ public class SlabAllocator implements MemoryAllocator, AutoCloseable {
         this.slabSize = slabSize;
         // Use NativeMemory.malloc for raw, uninitialized memory (Lazy commit by OS)
         this.segment = NativeMemory.malloc(memorySize);
+        if (zeroMemoryOnStartup) {
+            // One-time memset to eliminate ambient data from the OS. Pays a page-fault
+            // cost up front in exchange for deterministic memory content.
+            segment.fill((byte) 0);
+        }
 
         // Reserved Buddy space at end (25% or fixed?)
         long bSizePref = memorySize / 4;

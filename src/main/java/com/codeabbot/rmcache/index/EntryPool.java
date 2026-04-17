@@ -666,17 +666,23 @@ public class EntryPool implements AutoCloseable {
                 if (packedHandle == -1L)
                     return false;
 
-                long relOffset = absOffset - baseAddr;
-                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
-
+                // AUDIT-A4: publish-before-free ordering. The earlier code freed
+                // the old block before the volatile setVolatile below; during that
+                // window, concurrent optimistic readers saw the slot pointing at
+                // already-reclaimed memory (use-after-free). Matches the ordering
+                // already used by updateValueWithWriter / updateValueWithSerializer.
                 long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                int newSc = AllocationHandle.unpackSizeClass(packedHandle);
                 byte fingerprint = computeFingerprint(k, k.length);
                 writeHeader(newAbsOffset, h, AllocationHandle.unpackCapacity(packedHandle),
-                        AllocationHandle.unpackSizeClass(packedHandle), p, e, slot, fingerprint);
+                        newSc, p, e, slot, fingerprint);
                 writeData(newAbsOffset, k, k.length, valueBytes, valueLen);
 
                 LONG_HANDLE.setVolatile(offsets, (long) slot * 8L,
-                        packOffset(newAbsOffset, AllocationHandle.unpackSizeClass(packedHandle)));
+                        packOffset(newAbsOffset, newSc));
+
+                long relOffset = absOffset - baseAddr;
+                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
                 return true;
             } finally {
                 lock.unlock();

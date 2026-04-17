@@ -230,6 +230,29 @@ public class CacheBuilder<K, V> {
         return this;
     }
 
+    /**
+     * Typed shortcut: declare that this cache stores {@code String} values and use
+     * the built-in UTF-8 String serializer. Equivalent to
+     * {@code .valueSerializer(BuiltInSerializers.string())} but keeps the
+     * {@code <K, V>} type parameter honest in the call site.
+     */
+    @SuppressWarnings("unchecked")
+    public CacheBuilder<K, V> forStringValues() {
+        this.valueSerializer = (ValueSerializer<V>) BuiltInSerializers.STRING_VALUE;
+        return this;
+    }
+
+    /**
+     * Typed shortcut: declare that this cache stores {@code byte[]} values and use
+     * the built-in byte-array serializer. Equivalent to
+     * {@code .valueSerializer(BuiltInSerializers.byteArray())}.
+     */
+    @SuppressWarnings("unchecked")
+    public CacheBuilder<K, V> forByteArrayValues() {
+        this.valueSerializer = (ValueSerializer<V>) BuiltInSerializers.byteArray();
+        return this;
+    }
+
     public CacheBuilder<K, V> eviction(EvictionPolicy policy) {
         this.evictionPolicy = policy;
         return this;
@@ -337,8 +360,23 @@ public class CacheBuilder<K, V> {
                 : (KeySerializer<K>) (stringKeyEncoding == StringEncoding.LATIN1
                         ? BuiltInSerializers.STRING_KEY_LATIN1
                         : BuiltInSerializers.STRING_KEY_UTF8);
-        ValueSerializer<V> vSer = (valueSerializer != null) ? valueSerializer
-                : (ValueSerializer<V>) BuiltInSerializers.STRING_VALUE;
+        // AUDIT-A1: when no explicit valueSerializer is set, default to STRING_VALUE
+        // for the common <String, String> ergonomic case BUT emit a one-time WARN
+        // to push users toward an explicit serializer. The previous silent default
+        // could mask a <String, byte[]> mistake (byte[] would hit a ClassCastException
+        // on the first put from STRING_VALUE's bridge method — not silent corruption,
+        // but a cryptic error). Typed shortcuts .forStringValues() /
+        // .forByteArrayValues() are the preferred opt-in.
+        ValueSerializer<V> vSer;
+        if (valueSerializer != null) {
+            vSer = valueSerializer;
+        } else {
+            org.slf4j.LoggerFactory.getLogger(CacheBuilder.class).warn(
+                    "No valueSerializer configured; defaulting to STRING_VALUE. "
+                            + "Prefer an explicit .valueSerializer(...) or one of the "
+                            + "typed shortcuts .forStringValues() / .forByteArrayValues().");
+            vSer = (ValueSerializer<V>) BuiltInSerializers.STRING_VALUE;
+        }
 
         SlabAllocator allocator = null;
         EntryPool entryPool = null;
@@ -346,7 +384,7 @@ public class CacheBuilder<K, V> {
         EvictionPolicy policy = null;
         OffHeapGhostCache offHeapGhostCache = null;
         try {
-            allocator = new SlabAllocator(finalMemory, slabSize);
+            allocator = new SlabAllocator(finalMemory, slabSize, zeroMemory);
             entryPool = new EntryPool(allocator, maxEntries, partitions);
 
             // S6 defense-in-depth: OffHeapCompactLRU packs segment flags into
@@ -378,7 +416,8 @@ public class CacheBuilder<K, V> {
                     kSer, vSer, allocator, entryPool, hashTable, policy,
                     evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
                     asyncExecutor,
-                    backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark);
+                    backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark,
+                    cacheName);
             return cache;
         } catch (Throwable t) {
             // Clean up partially allocated native resources

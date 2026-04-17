@@ -16,16 +16,17 @@
 package com.codeabbot.rmcache.eviction;
 
 /**
- * Read-only view of entry metadata.
+ * Read-only view of entry metadata exposed to {@link EvictionFilter}.
+ *
+ * <p>Only values that are truthfully sourced from the native entry header are
+ * exposed. Creation time and age are not tracked — storing an extra 8 bytes
+ * per entry costs 8 GB at billion-entry scale and no first-party feature needs
+ * them. If you require age-based eviction, use TTLs.
  */
 public interface EntryMetadata {
     short getPriority();
 
-    int getCreatedAtSeconds();
-
     int getExpiresAtSeconds();
-
-    long getAgeMillis();
 
     boolean isExpired();
 }
