@@ -147,9 +147,15 @@ publishing {
     repositories {
         maven {
             name = "OSSRH"
-            url = uri(version.toString().endsWith("-SNAPSHOT")
-                ? "https://s01.oss.sonatype.org/content/repositories/snapshots/"
-                : "https://s01.oss.sonatype.org/service/local/staging/deploy/maven2/")
+            // Defaults point at the Sonatype Central Portal's OSSRH-compatibility
+            // endpoints, which accept the same Maven deploys as the legacy OSSRH
+            // URLs. Override via -PsonatypeReleaseUrl / -PsonatypeSnapshotUrl
+            // (or the corresponding env vars) if you're still on s01.oss.sonatype.org.
+            def defaultRelease = "https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/"
+            def defaultSnapshot = "https://central.sonatype.com/repository/maven-snapshots/"
+            def releaseUrl = findProperty("sonatypeReleaseUrl") ?: System.getenv("SONATYPE_RELEASE_URL") ?: defaultRelease
+            def snapshotUrl = findProperty("sonatypeSnapshotUrl") ?: System.getenv("SONATYPE_SNAPSHOT_URL") ?: defaultSnapshot
+            url = uri(version.toString().endsWith("-SNAPSHOT") ? snapshotUrl : releaseUrl)
             credentials {
                 username = findProperty("ossrhUsername") ?: System.getenv("OSSRH_USERNAME") ?: ""
                 password = findProperty("ossrhPassword") ?: System.getenv("OSSRH_PASSWORD") ?: ""
@@ -159,8 +165,16 @@ publishing {
 }
 
 signing {
-    // Sign only when publishing to OSSRH (not for local builds)
+    // Sign only when publishing (not for local builds). Supports both the
+    // classic keyring-file properties (signing.keyId / signing.secretKeyRingFile
+    // / signing.password) and an in-memory ASCII-armored key, which is easier
+    // to wire up in CI. If `signingKey` is set, it takes precedence.
     required { gradle.taskGraph.hasTask("publish") }
+    def signingKey = findProperty("signingKey") ?: System.getenv("SIGNING_KEY")
+    def signingPassword = findProperty("signingPassword") ?: System.getenv("SIGNING_PASSWORD")
+    if (signingKey) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+    }
     sign publishing.publications.maven
 }
 
