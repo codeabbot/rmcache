@@ -151,6 +151,26 @@ public class TTLPolicy implements EvictionPolicy {
         return entryCount.get() >= maxEntries;
     }
 
+    @Override
+    public long getDefaultTTLMs() {
+        return defaultTTLMs;
+    }
+
+    @Override
+    public boolean tracksTTL() {
+        return wheel != null;
+    }
+
+    @Override
+    public void onTTLUpdate(int slot) {
+        // AUDIT-A5: add a fresh heap entry for this slot. Duplicates are harmless
+        // because pollExpiredOne drains cancelled/freed slots naturally (the
+        // second occurrence hits expiresAt<=0 after the first eviction).
+        if (wheel != null) {
+            wheel.schedule(slot);
+        }
+    }
+
     /**
      * Check if a slot is expired by reading directly from the entry block.
      * This is O(1) and involves no heap allocation.

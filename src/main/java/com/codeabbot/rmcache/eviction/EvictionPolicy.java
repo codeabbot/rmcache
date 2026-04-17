@@ -57,6 +57,32 @@ public interface EvictionPolicy extends AutoCloseable {
     default void setEntryPool(EntryPool pool) {
     }
 
+    /**
+     * AUDIT-A2: default TTL in milliseconds that OffHeapCacheImpl stamps on
+     * entries inserted via {@code put(k, v)} (no explicit duration). Return
+     * {@code 0} if the policy does not impose a default TTL.
+     */
+    default long getDefaultTTLMs() {
+        return 0L;
+    }
+
+    /**
+     * AUDIT-A5: called by OffHeapCacheImpl after {@code setExpiresAt} on an
+     * in-place TTL update, so the policy can reschedule any heap/wheel
+     * entry that ordered the slot by its previous expiry.
+     */
+    default void onTTLUpdate(int slot) {
+    }
+
+    /**
+     * AUDIT-A5: does this policy track per-slot TTLs? OffHeapCacheImpl uses
+     * this flag to skip the {@link #onTTLUpdate} call on caches that have no
+     * TTL tracking (the common benchmark-path case with no eviction policy).
+     */
+    default boolean tracksTTL() {
+        return false;
+    }
+
     /** Free resources */
     @Override
     default void close() {

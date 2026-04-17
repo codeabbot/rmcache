@@ -345,13 +345,32 @@ public class EntryPool implements AutoCloseable {
 
     public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer) {
         int pIdx = slot >>> partitionShift;
-        return partitions[pIdx].updateValueWithWriter(slot, valueMaxLen, writer);
+        return partitions[pIdx].updateValueWithWriter(slot, valueMaxLen, writer, 0);
+    }
+
+    /**
+     * AUDIT-A3: Same as {@link #updateValueWithWriter(int, int, ValueWriter)}
+     * but rejects the update when the stored key-hash at {@code slot} no longer
+     * matches {@code expectedKeyHash} (e.g., slot was reallocated to a different
+     * key between ghost-cache lookup and update). Pass {@code 0} to skip.
+     */
+    public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer, int expectedKeyHash) {
+        int pIdx = slot >>> partitionShift;
+        return partitions[pIdx].updateValueWithWriter(slot, valueMaxLen, writer, expectedKeyHash);
     }
 
     public <V> boolean updateValueWithSerializer(int slot, int valueMaxLen,
             com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value) {
         int pIdx = slot >>> partitionShift;
-        return partitions[pIdx].updateValueWithSerializer(slot, valueMaxLen, serializer, value);
+        return partitions[pIdx].updateValueWithSerializer(slot, valueMaxLen, serializer, value, 0);
+    }
+
+    /** AUDIT-A3: keyhash-guarded variant. See {@link #updateValueWithWriter(int, int, ValueWriter, int)}. */
+    public <V> boolean updateValueWithSerializer(int slot, int valueMaxLen,
+            com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value,
+            int expectedKeyHash) {
+        int pIdx = slot >>> partitionShift;
+        return partitions[pIdx].updateValueWithSerializer(slot, valueMaxLen, serializer, value, expectedKeyHash);
     }
 
     public int getValueLen(int slot) {
@@ -689,13 +708,21 @@ public class EntryPool implements AutoCloseable {
             }
         }
 
-        public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer) {
+        public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer, int expectedKeyHash) {
             lock.lock();
             try {
                 long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
                 if (packed == -1L)
                     return false;
                 long absOffset = unpackAddr(packed);
+                // AUDIT-A3: catch stale ghost-slot updates where the slot has been
+                // reallocated to a different key since the ghost-cache lookup.
+                // Free when expectedKeyHash == 0 (direct-update callers).
+                if (expectedKeyHash != 0) {
+                    int storedHash = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset);
+                    if (storedHash != expectedKeyHash)
+                        return false;
+                }
                 int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
                 int sc = unpackSC(packed);
                 int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0; // derive capacity
@@ -748,13 +775,21 @@ public class EntryPool implements AutoCloseable {
         }
 
         public <V> boolean updateValueWithSerializer(int slot, int valueMaxLen,
-                com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value) {
+                com.codeabbot.rmcache.serializer.SegmentValueSerializer<V> serializer, V value,
+                int expectedKeyHash) {
             lock.lock();
             try {
                 long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
                 if (packed == -1L)
                     return false;
                 long absOffset = unpackAddr(packed);
+                // AUDIT-A3: keyhash guard — reject updates where the slot has been
+                // reallocated to a different key since the ghost-cache lookup.
+                if (expectedKeyHash != 0) {
+                    int storedHash = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset);
+                    if (storedHash != expectedKeyHash)
+                        return false;
+                }
                 int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
                 int sc = unpackSC(packed);
                 int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0; // derive capacity

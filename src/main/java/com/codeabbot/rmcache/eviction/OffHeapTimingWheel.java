@@ -175,6 +175,16 @@ public final class OffHeapTimingWheel implements AutoCloseable {
                         refreshEarliestExpiry();
                         return head;
                     }
+                    // AUDIT-A5: the head's expiresAt may have been mutated in
+                    // place by OffHeapCacheImpl.put(..., ttl). Sift it down to
+                    // restore the min-heap invariant and re-check. If the head
+                    // slot doesn't change, the stripe is genuinely unexpired.
+                    if (sizes[i] > 1) {
+                        siftDown(i, 0);
+                        if (getSlot(i, 0) != head) {
+                            continue; // re-evaluate the new head
+                        }
+                    }
                     break; // Head is not expired yet
                 }
             } finally {

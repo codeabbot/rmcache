@@ -166,6 +166,13 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     private final String cacheName;
 
+    // AUDIT-A2 + AUDIT-A5: captured once at ctor. `hasDefaultTTL` and
+    // `tracksTTL` gate the two extra per-put branches behind predicted-false
+    // tests, keeping caches without a TTL policy at zero overhead.
+    private final long defaultTTLMs;
+    private final boolean hasDefaultTTL;
+    private final boolean tracksTTL;
+
     public OffHeapCacheImpl(
             KeySerializer<K> keySerializer,
             ValueSerializer<V> valueSerializer,
@@ -222,6 +229,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.evictionHighWatermark = evictionHighWatermark;
         this.evictionLowWatermark = evictionLowWatermark;
         this.cacheName = (cacheName == null || cacheName.isEmpty()) ? "rmcache" : cacheName;
+
+        long defTTL = evictionPolicy.getDefaultTTLMs();
+        this.defaultTTLMs = defTTL;
+        this.hasDefaultTTL = defTTL > 0L;
+        this.tracksTTL = evictionPolicy.tracksTTL();
 
         maintenanceExecutor.scheduleWithFixedDelay(() -> {
             try {
@@ -398,18 +410,29 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             valueLen = valueBytes.length;
         }
 
-        long expiresAtMillis = (ttl != null) ? CoarseClock.getNow() + ttl.toMillis() : 0L;
+        // AUDIT-A2: apply TTLPolicy.defaultTTLMs when the caller did not pass an
+        // explicit duration. `hasDefaultTTL` is predicted-false for caches with
+        // no TTL policy, so the common path is effectively unchanged.
+        long expiresAtMillis;
+        if (ttl != null) {
+            expiresAtMillis = CoarseClock.getNow() + ttl.toMillis();
+        } else if (hasDefaultTTL) {
+            expiresAtMillis = CoarseClock.getNow() + defaultTTLMs;
+        } else {
+            expiresAtMillis = 0L;
+        }
 
         if (existingSlot != 0) {
             // Respect putIfAbsent concurrency
             if (putIfAbsent)
                 return false;
 
-            // AUDIT-C1: Pass keyHash for key-hash guard inside updateValue.
+            // AUDIT-C1 + AUDIT-A3: Pass keyHash for key-hash guard inside updateValue.
             // This catches ghost-cache TOCTOU where slot was reallocated to
             // a different key — one off-heap int read under the SubPool lock.
+            // Applied to all three update paths (byte[]/writer/serializer).
             boolean updated = (segSer != null)
-                    ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value)
+                    ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value, keyHash)
                     : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen, keyHash);
 
             if (updated) {
@@ -418,6 +441,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 // expiration — clearing it would be a surprising behavior change.
                 if (ttl != null) {
                     entryPool.setExpiresAt(existingSlot, expiresAtMillis);
+                    // AUDIT-A5: reschedule so the timing-wheel heap reflects the
+                    // new expiry. Gated on `tracksTTL` so non-TTL caches pay
+                    // nothing.
+                    if (tracksTTL) {
+                        evictionPolicy.onTTLUpdate(existingSlot);
+                    }
                 }
                 evictionPolicy.onAccess(existingSlot, keyHash);
                 // Skip ghost cache bookkeeping on updates — slot already tracked

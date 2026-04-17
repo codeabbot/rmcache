@@ -117,4 +117,30 @@ public class CompositePolicy implements EvictionPolicy {
             policies[i].setEntryPool(pool);
         }
     }
+
+    @Override
+    public long getDefaultTTLMs() {
+        for (int i = 0; i < policyCount; i++) {
+            long t = policies[i].getDefaultTTLMs();
+            if (t > 0L)
+                return t;
+        }
+        return 0L;
+    }
+
+    @Override
+    public boolean tracksTTL() {
+        for (int i = 0; i < policyCount; i++) {
+            if (policies[i].tracksTTL())
+                return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void onTTLUpdate(int slot) {
+        for (int i = 0; i < policyCount; i++) {
+            policies[i].onTTLUpdate(slot);
+        }
+    }
 }
