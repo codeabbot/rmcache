@@ -145,6 +145,74 @@ public class EntryPoolCoverageTest {
         }
     }
 
+    // ── AUDIT-A3: keyhash guard on serializer/writer update paths ────────────
+
+    @Test
+    void updateValueWithSerializer_keyHashMismatch_rejects() {
+        try (SlabAllocator alloc = new SlabAllocator(MB4, 64 * 1024);
+             EntryPool pool = new EntryPool(alloc, 1000, 64)) {
+
+            int keyHash = 0xA1B2C3D4;
+            int staleHash = 0xDEADBEEF;
+            byte[] keyBytes = "a3-key".getBytes(StandardCharsets.UTF_8);
+            byte[] origValue = new byte[]{1, 2, 3};
+            SegmentValueSerializer<byte[]> ser = BuiltInSerializers.ByteArrayValueSerializer.INSTANCE;
+
+            int slot = pool.allocateWithSerializer(keyHash, keyBytes, keyBytes.length,
+                    ser.estimateSize(origValue), ser, origValue, (short) 0, 0L);
+            assertTrue(slot > 0);
+
+            byte[] newValue = new byte[]{9, 9, 9};
+            int newSize = ser.estimateSize(newValue);
+
+            // Mismatched hash → reject, original preserved
+            assertFalse(pool.updateValueWithSerializer(slot, newSize, ser, newValue, staleHash),
+                    "stale keyHash must be rejected");
+            assertArrayEquals(origValue, pool.readValue(slot));
+
+            // Matching hash → accept
+            assertTrue(pool.updateValueWithSerializer(slot, newSize, ser, newValue, keyHash));
+            assertArrayEquals(newValue, pool.readValue(slot));
+
+            // expectedKeyHash == 0 → guard bypassed (direct-caller contract)
+            byte[] thirdValue = new byte[]{7, 7, 7};
+            assertTrue(pool.updateValueWithSerializer(slot, ser.estimateSize(thirdValue), ser, thirdValue, 0));
+            assertArrayEquals(thirdValue, pool.readValue(slot));
+
+            pool.free(slot);
+        }
+    }
+
+    @Test
+    void updateValueWithWriter_keyHashMismatch_rejects() {
+        try (SlabAllocator alloc = new SlabAllocator(MB4, 64 * 1024);
+             EntryPool pool = new EntryPool(alloc, 1000, 64)) {
+
+            int keyHash = 0x11112222;
+            int staleHash = 0xCAFEBABE;
+            byte[] keyBytes = "a3w-key".getBytes(StandardCharsets.UTF_8);
+            byte[] origValue = "original".getBytes(StandardCharsets.UTF_8);
+
+            int slot = pool.allocateWithLen(keyHash, keyBytes, keyBytes.length,
+                    origValue, origValue.length, (short) 0, 0L);
+            assertTrue(slot > 0);
+
+            byte[] newValue = "replaced".getBytes(StandardCharsets.UTF_8);
+            ValueWriter writer = (segment, offset, maxLen) -> {
+                MemorySegment.copy(newValue, 0, segment, ValueLayout.JAVA_BYTE, offset, newValue.length);
+                return newValue.length;
+            };
+
+            assertFalse(pool.updateValueWithWriter(slot, newValue.length, writer, staleHash));
+            assertArrayEquals(origValue, pool.readValue(slot));
+
+            assertTrue(pool.updateValueWithWriter(slot, newValue.length, writer, keyHash));
+            assertArrayEquals(newValue, pool.readValue(slot));
+
+            pool.free(slot);
+        }
+    }
+
     // ── getValuePosition ─────────────────────────────────────────────────────
 
     @Test
