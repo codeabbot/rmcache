@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.codeabbot"
-version = "1.0.0"
+version = "0.0.1"
 
 java {
     toolchain {
@@ -163,19 +163,45 @@ publishing {
         }
     }
 }
-
 signing {
-    // Sign only when publishing (not for local builds). Supports both the
-    // classic keyring-file properties (signing.keyId / signing.secretKeyRingFile
-    // / signing.password) and an in-memory ASCII-armored key, which is easier
-    // to wire up in CI. If `signingKey` is set, it takes precedence.
-    required { gradle.taskGraph.hasTask("publish") }
+    // Sign whenever any publish-related task is in the graph (publish,
+    // publishMavenPublicationToOSSRHRepository, etc.) but not for plain local
+    // builds. Supports both the classic keyring-file properties
+    // (signing.keyId / signing.secretKeyRingFile / signing.password) and an
+    // in-memory ASCII-armored key (CI-friendly). In-memory mode wins when set.
+    required { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
+
     def signingKey = findProperty("signingKey") ?: System.getenv("SIGNING_KEY")
     def signingPassword = findProperty("signingPassword") ?: System.getenv("SIGNING_PASSWORD")
-    if (signingKey) {
-        useInMemoryPgpKeys(signingKey, signingPassword)
+    def rawKeyId = findProperty("signingKeyId") ?: System.getenv("SIGNING_KEY_ID") ?: findProperty("signing.keyId")
+
+    // Gradle's PgpKeyId only parses short (8-char) keyIds, but modern GPG
+    // tooling emits long (16-char) keyIds. Normalize to the last 8 chars so
+    // users can paste the output of `gpg --list-secret-keys --keyid-format=long`
+    // directly without Gradle choking on PgpKeyId.normaliseKeyId.
+    def signingKeyId = rawKeyId?.toString()?.replaceFirst(/^0x/, '')
+    if (signingKeyId && signingKeyId.length() > 8) {
+        signingKeyId = signingKeyId.substring(signingKeyId.length() - 8)
     }
-    sign publishing.publications.maven
+
+    if (signingKey) {
+        // Fail loudly if the property is set but obviously not an ASCII-armored
+        // key. Real armored keys are thousands of chars; a 40-char value is
+        // almost always a fingerprint or keyId pasted into the wrong property.
+        // Gradle's downstream error for this is "no configured signatory",
+        // which is opaque.
+        if (signingKey.toString().length() < 256 || !signingKey.toString().contains("BEGIN PGP PRIVATE KEY")) {
+            throw new GradleException(
+                "signingKey does not look like an ASCII-armored PGP private key " +
+                "(got ${signingKey.toString().length()} chars, expected thousands). " +
+                "Paste the full output of " +
+                "`gpg --export-secret-keys --armor <keyId>` including the " +
+                "BEGIN/END PGP PRIVATE KEY BLOCK lines.")
+        }
+        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+    }
+
+    sign publishing.publications
 }
 
 // ─── Custom tasks ────────────────────────────────────────────────────────────
