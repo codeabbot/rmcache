@@ -97,6 +97,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final EvictionFilter<K> evictionFilter;
     private final GhostCache<K, V> ghostCache;
     private final OffHeapGhostCache offHeapGhostCache;
+    private final MetricsRecorder metrics;
 
     private final LongAdder globalHits = new LongAdder();
     private final LongAdder globalMisses = new LongAdder();
@@ -189,7 +190,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
             double evictionLowWatermark,
-            String cacheName) {
+            String cacheName,
+            MetricsRecorder metrics) {
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init start");
         }
@@ -229,6 +231,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.evictionHighWatermark = evictionHighWatermark;
         this.evictionLowWatermark = evictionLowWatermark;
         this.cacheName = (cacheName == null || cacheName.isEmpty()) ? "rmcache" : cacheName;
+        this.metrics = (metrics == null) ? MetricsRecorder.NOOP : metrics;
 
         long defTTL = evictionPolicy.getDefaultTTLMs();
         this.defaultTTLMs = defTTL;
@@ -346,6 +349,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             throw new IllegalStateException("Closed");
 
         putInternal(key, value, ttl, priority);
+        metrics.onPut();
     }
 
     private void putInternal(K key, V value, Duration ttl, short priority) {
@@ -753,6 +757,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         removeInternal(keyHash, keyBytes, keyLen, slot, EvictionCause.EXPLICIT);
+        metrics.onRemove();
         return true;
     }
 
@@ -764,7 +769,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public boolean putIfAbsent(K key, V value, Duration ttl) {
         checkNotClosed();
-        return putInternal(key, value, ttl, (short) 0, true);
+        boolean inserted = putInternal(key, value, ttl, (short) 0, true);
+        if (inserted) {
+            metrics.onPut();
+        }
+        return inserted;
     }
 
     @Override
