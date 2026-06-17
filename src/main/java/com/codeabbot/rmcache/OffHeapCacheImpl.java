@@ -664,7 +664,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         globalHits.increment();
         evictionPolicy.onAccess(slot, keyHash);
 
-        V result = readValueFromSlot(slot, ctx);
+        V result = readValueFromSlot(slot, keyHash, ctx);
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, result);
@@ -674,17 +674,24 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return result;
     }
 
-    private V readValueFromSlot(int slot, CacheContext ctx) {
-        // C3 fix: Guard against slot freed between lookup and read
-        if (entryPool.getOffset(slot) == -1L)
+    private V readValueFromSlot(int slot, int keyHash, CacheContext ctx) {
+        // A2 (ABA guard) + hot-path read reduction: read the block offset ONCE,
+        // copy the value through that snapshot, then validate. The prior C1/C3
+        // guard only re-checked "freed" (offset == -1); a slot freed AND reused by
+        // a different key mid-copy leaves a valid (non -1) offset, so that guard
+        // could return another key's bytes. Requiring the offset to be unchanged
+        // AND the stored key-hash to still equal the lookup hash detects that race.
+        // Reading the offset once (instead of re-reading it through getValueLen /
+        // readValueToBuffer / readValue) also removes redundant volatile reads.
+        long off = entryPool.getOffset(slot);
+        if (off == -1L)
             return null;
+
         if (isByteArrayValue) {
-            int valLen = entryPool.getValueLen(slot);
+            int valLen = entryPool.getValueLenAt(off);
             byte[] vBuf = ctx.ensureCapacity(valLen);
-            entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
-            // C1 fix: Post-read validation — if slot was freed while we were
-            // copying bytes, the data may be corrupt. Re-check offset.
-            if (entryPool.getOffset(slot) == -1L)
+            entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
+            if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             @SuppressWarnings("unchecked")
             V res = (V) Arrays.copyOf(vBuf, valLen);
@@ -692,18 +699,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (cachedStreamSer != null) {
-            int valLen = entryPool.getValueLen(slot);
+            int valLen = entryPool.getValueLenAt(off);
             byte[] vBuf = ctx.ensureCapacity(valLen);
-            entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
-            // C1 fix: Post-read validation
-            if (entryPool.getOffset(slot) == -1L)
+            entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
+            if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
 
-        byte[] valBytes = entryPool.readValue(slot);
-        // C1 fix: Post-read validation
-        if (entryPool.getOffset(slot) == -1L)
+        byte[] valBytes = entryPool.readValueAt(off);
+        if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
             return null;
         return valueSerializer.deserialize(valBytes);
     }
