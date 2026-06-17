@@ -102,6 +102,19 @@ public class EntryPool implements AutoCloseable {
         this.baseSegment = allocator.getSegment();
         this.baseAddr = baseSegment.address();
 
+        // B2: packOffset() stores the size class in bits 48-55, so every absolute
+        // block address must fit in the low 48 bits (ADDR_MASK). malloc on a
+        // 5-level-paging (LA57) host can return higher addresses, which would be
+        // silently truncated and corrupt the offset table. Detect it once here, at
+        // construction, rather than on the hot path. (No effect on get/put latency.)
+        long topAddr = baseAddr + baseSegment.byteSize() - 1L;
+        if ((baseAddr & ~ADDR_MASK) != 0L || (topAddr & ~ADDR_MASK) != 0L) {
+            throw new IllegalStateException(
+                    "Off-heap region [0x" + Long.toHexString(baseAddr) + ", 0x"
+                            + Long.toHexString(topAddr) + "] exceeds the 48-bit address space assumed "
+                            + "by the packed offset table (e.g. 5-level paging / LA57); not supported.");
+        }
+
         this.partitions = new SubPool[numPartitions];
         for (int i = 0; i < numPartitions; i++) {
             this.partitions[i] = new SubPool(i, 1 << shift);
