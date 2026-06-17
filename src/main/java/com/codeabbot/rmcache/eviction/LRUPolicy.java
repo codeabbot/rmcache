@@ -204,9 +204,16 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
             shardLocks[shard].lock();
             try {
                 if (shards[shard].probationSize > 0) {
-                    int victim = shards[shard].pollProbation();
-                    // H3 fix: decrement here since poll already removed from list;
-                    // onRemove will see segment=NONE and skip double-decrement.
+                    int victim = admissionVictim(shard);
+                    // H3 fix: decrement here since the poll already removed it from
+                    // the list; onRemove sees segment=NONE and skips double-decrement.
+                    entryCount.decrementAndGet();
+                    return victim;
+                }
+                // A3 fix: evict the colder WINDOW before the hotter PROTECTED
+                // segment (protected holds the most-reused entries — last resort).
+                if (shards[shard].windowSize > 0) {
+                    int victim = shards[shard].pollWindow();
                     entryCount.decrementAndGet();
                     return victim;
                 }
@@ -215,16 +222,46 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
                     entryCount.decrementAndGet();
                     return victim;
                 }
-                if (shards[shard].windowSize > 0) {
-                    int victim = shards[shard].pollWindow();
-                    entryCount.decrementAndGet();
-                    return victim;
-                }
             } finally {
                 shardLocks[shard].unlock();
             }
         }
         return 0;
+    }
+
+    /**
+     * W-TinyLFU admission, evaluated lazily at eviction time so the get/put hot
+     * path pays nothing. The probation MRU head is the most-recently-admitted
+     * window graduate (the admission "candidate"); the LRU tail is the SLRU
+     * "victim". If the candidate's estimated frequency is lower than the victim's,
+     * the candidate is evicted instead — so a one-hit scan entry never displaces a
+     * higher-frequency established entry. Runs under the shard lock on the
+     * background eviction thread.
+     *
+     * <p>This is the classic {@code freq(candidate) > freq(victim)} decision, but
+     * deferred from the insert path to the eviction path, which is where it is
+     * free. Caller must hold {@code shardLocks[shard]}.
+     */
+    private int admissionVictim(int shard) {
+        OffHeapCompactLRU s = shards[shard];
+        if (entryPool == null || s.probationSize <= 1) {
+            return s.pollProbation();
+        }
+        int tail = s.peekProbationTail(); // SLRU victim (oldest)
+        int head = s.peekProbationHead(); // admission candidate (newest from window)
+        if (head == tail || head == 0) {
+            return s.pollProbation();
+        }
+        int tailFreq = frequencySketch.frequency(entryPool.getKeyHash(tail));
+        int headFreq = frequencySketch.frequency(entryPool.getKeyHash(head));
+        if (headFreq < tailFreq) {
+            // Candidate colder than the victim → reject the candidate (scan resistance).
+            s.removeProbation(head);
+            return head;
+        }
+        // Candidate earns its place → evict the LRU victim as usual.
+        s.removeProbation(tail);
+        return tail;
     }
 
     @Override
