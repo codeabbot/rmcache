@@ -15,6 +15,7 @@ _Nothing yet._
 
 ### Added
 - **Peer benchmark suite** — `FairComparisonScaleBenchmark` now compares RMCache (plain + OFF_HEAP GhostCache) against Caffeine (on-heap reference), Chronicle Map, OHC, MapDB, and EhCache in one internally-consistent run; new `OHCComparisonBenchmark` isolates OHC's `Unsafe`-based allocator. Results published in the README.
+- **Tail-latency benchmark** — `TailLatencyBenchmark` (JMH `SampleTime`) reports p50/p90/p99/p99.9 for GET and PUT at 1M entries; the README shows RMCache's GET tail beating even on-heap Caffeine (off-heap means no GC jitter).
 - **Open-source governance** — `NOTICE`, `CLA.md` (Contributor License Agreement enabling the open-core model), GitHub issue/PR templates, `CODEOWNERS`, and Dependabot configuration.
 - **`examples/` subproject** — 5 runnable examples: `BasicCacheExample`, `TTLExample`, `ZeroCopyExample`, `EvictionExample`, `CustomSerializerExample`. Run via `./gradlew :examples:run<Name>`.
 - **JaCoCo coverage reporting** — `jacocoTestReport` task (HTML + XML) with 65% instruction coverage minimum (`jacocoTestCoverageVerification`). Baseline: 66.6% instruction, 67.9% line.
