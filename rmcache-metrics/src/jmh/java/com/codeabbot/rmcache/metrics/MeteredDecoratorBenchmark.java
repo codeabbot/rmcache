@@ -29,8 +29,8 @@ import java.util.concurrent.TimeUnit;
 /**
  * Measures the per-operation overhead the Tier 1 {@link MeteredOffHeapCache} decorator
  * adds. Compares the raw core cache against the same cache wrapped with counting only and
- * with counting + 1-in-1024 latency sampling. All three wrap identically-configured core
- * caches, so any latency delta is purely the decorator's instrumentation cost.
+ * with counting + 1-in-1024 latency sampling. All three views share one core cache, so
+ * any latency delta is purely the decorator's instrumentation cost.
  *
  * <p>Run: {@code ./gradlew :rmcache-metrics:jmh}
  */
@@ -43,27 +43,26 @@ import java.util.concurrent.TimeUnit;
 @Threads(4)
 public class MeteredDecoratorBenchmark {
 
-    @Param({"100000", "1000000"})
+    @Param({"10000", "100000", "1000000", "10000000"})
     public int entryCount;
 
     @Param("256")
     public int valueSize;
 
-    private OffHeapCache<String, byte[]> raw;
-    private OffHeapCache<String, byte[]> metered;   // counting only
-    private OffHeapCache<String, byte[]> sampled;   // counting + 1-in-1024 latency
+    private OffHeapCache<String, byte[]> core;
+    private OffHeapCache<String, byte[]> raw;       // = core, no decorator
+    private OffHeapCache<String, byte[]> metered;   // wraps core, counting only
+    private OffHeapCache<String, byte[]> sampled;   // wraps core, counting + 1-in-1024 latency
 
     @Setup(Level.Trial)
     public void setup() {
-        raw = build();
-        metered = new MeteredOffHeapCache<>(build());
-        sampled = new MeteredOffHeapCache<>(build(), 1024);
+        core = build();
+        raw = core;
+        metered = new MeteredOffHeapCache<>(core);
+        sampled = new MeteredOffHeapCache<>(core, 1024);
         byte[] value = new byte[valueSize];
         for (int i = 0; i < entryCount; i++) {
-            String k = "key-" + i;
-            raw.put(k, value);
-            metered.put(k, value);
-            sampled.put(k, value);
+            core.put("key-" + i, value);
         }
     }
 
@@ -80,9 +79,9 @@ public class MeteredDecoratorBenchmark {
 
     @TearDown(Level.Trial)
     public void tearDown() {
-        if (raw != null) raw.close();
-        if (metered != null) metered.close();
-        if (sampled != null) sampled.close();
+        if (core != null) {
+            core.close();
+        }
     }
 
     @Benchmark
