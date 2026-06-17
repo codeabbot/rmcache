@@ -355,8 +355,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
-        CacheContext ctx = context.get();
-
         int existingSlot = 0;
         byte[] keyBytes = null;
         int keyLen = 0;
@@ -393,6 +391,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (segSer != null) {
             valueMaxLen = Math.max(0, segSer.estimateSize(value));
         } else if (streamSer != null) {
+            // PERF: the per-thread scratch buffer is only needed by the streaming
+            // serializer, so fetch the ThreadLocal lazily here rather than up front
+            // (the byte[]/segment hot path never touches it).
+            CacheContext ctx = context.get();
             int estimate = Math.max(0, streamSer.estimateSize(value));
             byte[] buf = ctx.ensureCapacity(estimate);
             valueLen = streamSer.serializeTo(value, buf, 0);
@@ -599,7 +601,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (closed)
             return null;
 
-        CacheContext ctx = context.get();
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         if (hasGhostCache) {
@@ -664,7 +665,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         globalHits.increment();
         evictionPolicy.onAccess(slot, keyHash);
 
-        V result = readValueFromSlot(slot, ctx);
+        V result = readValueFromSlot(slot, keyHash);
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, result);
@@ -674,36 +675,48 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return result;
     }
 
-    private V readValueFromSlot(int slot, CacheContext ctx) {
-        // C3 fix: Guard against slot freed between lookup and read
-        if (entryPool.getOffset(slot) == -1L)
+    private V readValueFromSlot(int slot, int keyHash) {
+        // A2 (ABA guard) + hot-path read reduction: read the block offset ONCE,
+        // copy the value through that snapshot, then validate. The prior C1/C3
+        // guard only re-checked "freed" (offset == -1); a slot freed AND reused by
+        // a different key mid-copy leaves a valid (non -1) offset, so that guard
+        // could return another key's bytes. Requiring the offset to be unchanged
+        // AND the stored key-hash to still equal the lookup hash detects that race.
+        // Reading the offset once (instead of re-reading it through getValueLen /
+        // readValueToBuffer / readValue) also removes redundant volatile reads.
+        // O2: opaque read — no acquire barrier on ARM. The dependent value reads
+        // below are address-ordered after this load on real hardware, and the
+        // post-copy re-read detects any change, so volatile ordering isn't needed.
+        long off = entryPool.getOffsetOpaque(slot);
+        if (off == -1L)
             return null;
+
         if (isByteArrayValue) {
-            int valLen = entryPool.getValueLen(slot);
-            byte[] vBuf = ctx.ensureCapacity(valLen);
-            entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
-            // C1 fix: Post-read validation — if slot was freed while we were
-            // copying bytes, the data may be corrupt. Re-check offset.
-            if (entryPool.getOffset(slot) == -1L)
+            // PERF: copy straight off-heap into the freshly-allocated result array
+            // (one copy + one allocation). The previous path copied twice per get:
+            // off-heap -> reusable thread-local buffer, then Arrays.copyOf -> result.
+            byte[] result = entryPool.readValueAt(off);
+            if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             @SuppressWarnings("unchecked")
-            V res = (V) Arrays.copyOf(vBuf, valLen);
+            V res = (V) result;
             return res;
         }
 
         if (cachedStreamSer != null) {
-            int valLen = entryPool.getValueLen(slot);
+            // Streaming keeps the reusable buffer (deserializeFrom reads from it; no
+            // result array is allocated), so the intermediate copy is not wasted here.
+            int valLen = entryPool.getValueLenAt(off);
+            CacheContext ctx = context.get();
             byte[] vBuf = ctx.ensureCapacity(valLen);
-            entryPool.readValueToBuffer(slot, vBuf, 0, valLen);
-            // C1 fix: Post-read validation
-            if (entryPool.getOffset(slot) == -1L)
+            entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
+            if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
 
-        byte[] valBytes = entryPool.readValue(slot);
-        // C1 fix: Post-read validation
-        if (entryPool.getOffset(slot) == -1L)
+        byte[] valBytes = entryPool.readValueAt(off);
+        if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
             return null;
         return valueSerializer.deserialize(valBytes);
     }

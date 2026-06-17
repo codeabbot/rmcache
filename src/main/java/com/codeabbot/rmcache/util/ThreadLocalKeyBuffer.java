@@ -57,8 +57,21 @@ public final class ThreadLocalKeyBuffer {
             bufferHolder.set(buffer);
         }
 
+        int bits = 0;
         for (int i = 0; i < len; i++) {
-            buffer[i] = (byte) key.charAt(i);
+            char c = key.charAt(i);
+            bits |= c;
+            buffer[i] = (byte) c;
+        }
+        // A4: a char above U+00FF cannot be represented in one Latin-1 byte. The
+        // old code truncated it silently, letting distinct keys collide
+        // (e.g. 'U+0100' and '' both encode to 0x00) -- a silent
+        // wrong-value bug. Reject instead. The OR-accumulate keeps the loop
+        // branch-free; the check runs once per call (free for ASCII keys).
+        if ((bits & 0xFF00) != 0) {
+            throw new IllegalArgumentException(
+                    "LATIN1 key encoding requires ISO-8859-1 characters (<= U+00FF); "
+                            + "use StringEncoding.UTF8 for keys containing higher code points");
         }
 
         return len;
@@ -70,8 +83,16 @@ public final class ThreadLocalKeyBuffer {
 
     public static int encodeStringTo(String key, byte[] buffer) {
         int len = Math.min(key.length(), buffer.length);
+        int bits = 0;
         for (int i = 0; i < len; i++) {
-            buffer[i] = (byte) key.charAt(i);
+            char c = key.charAt(i);
+            bits |= c;
+            buffer[i] = (byte) c;
+        }
+        // A4: reject non-Latin-1 chars rather than truncating them (see encodeStringFast).
+        if ((bits & 0xFF00) != 0) {
+            throw new IllegalArgumentException(
+                    "LATIN1 key encoding requires ISO-8859-1 characters (<= U+00FF)");
         }
         return len;
     }

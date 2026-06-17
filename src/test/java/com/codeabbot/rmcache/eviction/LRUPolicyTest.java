@@ -17,6 +17,7 @@ package com.codeabbot.rmcache.eviction;
 
 import com.codeabbot.rmcache.index.EntryPool;
 import com.codeabbot.rmcache.memory.SlabAllocator;
+import java.lang.reflect.Field;
 import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,5 +70,62 @@ public class LRUPolicyTest {
 
         allocator.close();
         policy.close();
+    }
+
+    /**
+     * W-TinyLFU admission must consult the frequency sketch at eviction time:
+     * when a high-frequency entry sits at the probation LRU tail and a
+     * low-frequency one-hit candidate is the MRU head, the candidate is the one
+     * evicted and the hot tail survives. Plain FIFO tail eviction (the pre-fix
+     * "dead sketch" behavior) would instead have evicted the tail — the hot
+     * entry. This test therefore fails if the admission path ever regresses back
+     * to ignoring the sketch.
+     */
+    @Test
+    public void selectVictim_admissionProtectsHotTail_overColdCandidate() throws Exception {
+        SlabAllocator allocator = new SlabAllocator(16 * 1024 * 1024);
+        EntryPool pool = new EntryPool(allocator, 256);
+        LRUPolicy policy = new LRUPolicy(256);
+        try {
+            final int HOT_HASH = 0x1111_1111;
+            final int COLD_HASH = 0x2222_2222;
+            byte[] kh = "hot".getBytes();
+            byte[] kc = "cold".getBytes();
+            byte[] v = "v".getBytes();
+            int slotHot = pool.allocateWithLen(HOT_HASH, kh, kh.length, v, v.length, (short) 0, 0L);
+            int slotCold = pool.allocateWithLen(COLD_HASH, kc, kc.length, v, v.length, (short) 0, 0L);
+            assertTrue(slotHot > 0 && slotCold > 0 && slotHot != slotCold);
+
+            policy.setEntryPool(pool);
+
+            // Raise HOT_HASH's estimated frequency in the (post-setEntryPool) sketch.
+            Field fSketch = LRUPolicy.class.getDeclaredField("frequencySketch");
+            fSketch.setAccessible(true);
+            OffHeapFrequencySketch sketch = (OffHeapFrequencySketch) fSketch.get(policy);
+            for (int i = 0; i < 30; i++) {
+                sketch.increment(HOT_HASH);
+            }
+            assertTrue(sketch.frequency(HOT_HASH) > sketch.frequency(COLD_HASH),
+                    "hot key must have the higher estimated frequency");
+
+            // Force both into one shard's probation: HOT as LRU tail (oldest),
+            // COLD as MRU head (newest one-hit candidate).
+            Field fShards = LRUPolicy.class.getDeclaredField("shards");
+            fShards.setAccessible(true);
+            OffHeapCompactLRU[] shards = (OffHeapCompactLRU[]) fShards.get(policy);
+            OffHeapCompactLRU shard0 = shards[0];
+            shard0.addToProbation(slotHot);  // oldest -> tail
+            shard0.addToProbation(slotCold); // newest -> head
+
+            int victim = policy.selectVictim();
+
+            assertEquals(slotCold, victim,
+                    "admission must evict the low-frequency candidate, not the hot tail");
+            assertEquals(OffHeapCompactLRU.PROBATION, shard0.getSegment(slotHot),
+                    "high-frequency entry must remain resident after admission");
+        } finally {
+            policy.close();
+            allocator.close();
+        }
     }
 }

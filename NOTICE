@@ -1,0 +1,8 @@
+RMCache
+Copyright 2026 Rabindra Meher
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+RMCache's only runtime dependency is the SLF4J API (logging facade),
+which is distributed under the MIT License by QOS.ch.

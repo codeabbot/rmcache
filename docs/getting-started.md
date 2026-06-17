@@ -12,8 +12,18 @@ RMCache is an off-heap cache for JVM applications. It stores all key/value data 
 
 ```groovy
 dependencies {
-    implementation 'com.codeabbot:rmcache:1.0.0'
+    implementation 'com.codeabbot:rmcache:0.0.2'
 }
+```
+
+### Maven
+
+```xml
+<dependency>
+    <groupId>com.codeabbot</groupId>
+    <artifactId>rmcache</artifactId>
+    <version>0.0.2</version>
+</dependency>
 ```
 
 ### JVM Flags

@@ -102,6 +102,19 @@ public class EntryPool implements AutoCloseable {
         this.baseSegment = allocator.getSegment();
         this.baseAddr = baseSegment.address();
 
+        // B2: packOffset() stores the size class in bits 48-55, so every absolute
+        // block address must fit in the low 48 bits (ADDR_MASK). malloc on a
+        // 5-level-paging (LA57) host can return higher addresses, which would be
+        // silently truncated and corrupt the offset table. Detect it once here, at
+        // construction, rather than on the hot path. (No effect on get/put latency.)
+        long topAddr = baseAddr + baseSegment.byteSize() - 1L;
+        if ((baseAddr & ~ADDR_MASK) != 0L || (topAddr & ~ADDR_MASK) != 0L) {
+            throw new IllegalStateException(
+                    "Off-heap region [0x" + Long.toHexString(baseAddr) + ", 0x"
+                            + Long.toHexString(topAddr) + "] exceeds the 48-bit address space assumed "
+                            + "by the packed offset table (e.g. 5-level paging / LA57); not supported.");
+        }
+
         this.partitions = new SubPool[numPartitions];
         for (int i = 0; i < numPartitions; i++) {
             this.partitions[i] = new SubPool(i, 1 << shift);
@@ -434,6 +447,43 @@ public class EntryPool implements AutoCloseable {
         int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
         length = Math.min(length, vLen);
         MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, buffer, bufferOffset, length);
+    }
+
+    // ── A2: offset-based read variants ─────────────────────────────────────────
+    // The GET copy path reads a slot's block offset once (via getOffset) and then
+    // reuses that snapshot through these accessors, instead of re-reading the
+    // offset through every slot-based method. This trims redundant volatile reads
+    // on the hot path and lets the caller validate the offset (and stored key
+    // hash) post-copy to detect a free-then-reallocate (ABA) race.
+
+    /** Stored 32-bit key hash at a block offset (header field +0). */
+    public int getKeyHashAt(long off) {
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, off);
+    }
+
+    /** Value length for the block at {@code off}. Caller guarantees {@code off != -1}. */
+    public int getValueLenAt(long off) {
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, off + 20);
+        return NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, off + 20 + 4 + EntryBlockLayout.pad(keyLen));
+    }
+
+    /** Copy value bytes from the block at {@code off} into {@code buffer}. */
+    public void readValueToBufferAt(long off, byte[] buffer, int bufferOffset, int length) {
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, off + 20);
+        long vOffset = off + 20 + 4 + EntryBlockLayout.pad(keyLen);
+        int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
+        length = Math.min(length, vLen);
+        MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, buffer, bufferOffset, length);
+    }
+
+    /** Allocate and return value bytes for the block at {@code off}. */
+    public byte[] readValueAt(long off) {
+        int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, off + 20);
+        long vOffset = off + 20 + 4 + EntryBlockLayout.pad(keyLen);
+        int vLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
+        byte[] bytes = new byte[vLen];
+        MemorySegment.copy(NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4, bytes, 0, vLen);
+        return bytes;
     }
 
     public int slotCapacity() {

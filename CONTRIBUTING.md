@@ -85,6 +85,7 @@ Include benchmark output in your PR description. Compare before/after at 10K, 10
 ## PR Checklist
 
 Before submitting:
+- [ ] I have read and agree to the [Contributor License Agreement](CLA.md)
 - [ ] `./gradlew test` passes (all tests green)
 - [ ] If touching hot path: JMH before/after included, no regression
 - [ ] Javadoc added/updated for all public API changes
@@ -99,6 +100,14 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full technical design, and [ARCHI
 
 This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you agree to uphold this code.
 
-## License
+## Contributor License Agreement (CLA)
 
-By contributing, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE).
+Before your first contribution can be merged, you must agree to the project's
+[Contributor License Agreement](CLA.md). In short: **you keep ownership of your work**
+and license it to the project under the Apache License 2.0, while also granting the
+maintainer the right to offer the project under additional terms in the future (an
+open-core model). You accept the CLA by checking the box in the pull-request template
+on your first PR.
+
+The open-source distribution of RMCache, including your contributions, remains licensed
+under the [Apache License 2.0](LICENSE).

@@ -4,7 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.x (latest) | ✅ Active |
+| 0.0.x (latest) | ✅ Active |
 
 Only the latest release receives security fixes. Update to the current release before reporting an issue.
 
@@ -14,7 +14,7 @@ Only the latest release receives security fixes. Update to the current release b
 
 **Please do not file a public GitHub issue for security vulnerabilities.**
 
-Report security issues privately via GitHub's [Security Advisory](https://github.com/codeabbot/rmcache/security/advisories/new) feature, or email the maintainer directly (see commit history for contact information).
+Report security issues privately via GitHub's [Security Advisory](https://github.com/codeabbot/rmcache/security/advisories/new) feature, or email the maintainer at **maintainers@codeabbot.com**.
 
 Include:
 - A description of the vulnerability and its potential impact

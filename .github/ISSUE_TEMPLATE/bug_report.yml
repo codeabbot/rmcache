@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a defect in RMCache
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please complete the sections below so we can reproduce it quickly.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or a code snippet that reproduces the problem.
+      placeholder: |
+        1. Build a cache with ...
+        2. Call ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: RMCache version
+      placeholder: "0.0.2"
+    validations:
+      required: true
+  - type: input
+    id: jdk
+    attributes:
+      label: JDK vendor and version
+      placeholder: "Temurin 25.0.3"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system / architecture
+      placeholder: "macOS 15.5 (arm64)"
+    validations:
+      required: true
+  - type: textarea
+    id: benchmarks
+    attributes:
+      label: Benchmark output (performance issues only)
+      description: For latency/throughput issues, include JMH before/after numbers.
+    validations:
+      required: false

@@ -166,6 +166,16 @@ public class OffHeapCompactLRU implements AutoCloseable {
         probationSize++;
     }
 
+    /** Peek the probation MRU head (most recently admitted — the admission candidate) without removing it. 0 if empty. */
+    public int peekProbationHead() {
+        return headProbation;
+    }
+
+    /** Peek the probation LRU tail (the SLRU eviction victim) without removing it. 0 if empty. */
+    public int peekProbationTail() {
+        return tailProbation;
+    }
+
     public int pollProbation() {
         if (tailProbation == NONE)
             return 0;

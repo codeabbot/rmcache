@@ -7,7 +7,7 @@ plugins {
 }
 
 group = "com.codeabbot"
-version = "0.0.1"
+version = "0.0.2"
 
 java {
     toolchain {
@@ -24,15 +24,17 @@ repositories {
 dependencies {
     implementation libs.slf4j.api
 
+    testImplementation platform(libs.junit.bom)
     testImplementation libs.bundles.testing
-    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testRuntimeOnly libs.junit.platform.launcher
 
     jmh libs.jmh.core
     jmh libs.jmh.annproc
     jmh libs.caffeine
     jmh libs.mapdb
     jmh libs.chronicle.map
-    jmh "org.ehcache:ehcache:3.10.8"
+    jmh libs.ehcache
+    jmh libs.ohc.core
 }
 
 tasks.withType(Test).configureEach {
@@ -131,8 +133,8 @@ publishing {
                 }
                 developers {
                     developer {
-                        id = "codeabbot"
-                        name = "CodeAbbot Team"
+                        id = "rabindrameher"
+                        name = "Rabindra Meher"
                         email = "maintainers@codeabbot.com"
                     }
                 }
@@ -145,12 +147,14 @@ publishing {
         }
     }
     repositories {
+        // Legacy flow — `./gradlew publish` uploads here. Artifacts land in a
+        // staging area that is NOT auto-promoted to the Deployments dashboard;
+        // the caller must also POST to /manual/upload/defaultRepository/<ns>
+        // (or click "Close" in the Nexus UI) before the deployment becomes
+        // visible. Prefer `./gradlew publishToMavenCentral` (defined below)
+        // for hands-free release via the Publisher API.
         maven {
             name = "OSSRH"
-            // Defaults point at the Sonatype Central Portal's OSSRH-compatibility
-            // endpoints, which accept the same Maven deploys as the legacy OSSRH
-            // URLs. Override via -PsonatypeReleaseUrl / -PsonatypeSnapshotUrl
-            // (or the corresponding env vars) if you're still on s01.oss.sonatype.org.
             def defaultRelease = "https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/"
             def defaultSnapshot = "https://central.sonatype.com/repository/maven-snapshots/"
             def releaseUrl = findProperty("sonatypeReleaseUrl") ?: System.getenv("SONATYPE_RELEASE_URL") ?: defaultRelease
@@ -160,6 +164,14 @@ publishing {
                 username = findProperty("ossrhUsername") ?: System.getenv("OSSRH_USERNAME") ?: ""
                 password = findProperty("ossrhPassword") ?: System.getenv("OSSRH_PASSWORD") ?: ""
             }
+        }
+        // File-based staging for the Central Portal Publisher API. The task
+        // publishMavenPublicationToCentralPortalStagingRepository writes the
+        // Maven tree (with .asc/.md5/.sha1) here; bundleForCentralPortal zips
+        // it; publishToMavenCentral uploads with publishingType=AUTOMATIC.
+        maven {
+            name = "CentralPortalStaging"
+            url = layout.buildDirectory.dir("central-portal-staging").get().asFile.toURI()
         }
     }
 }
@@ -202,6 +214,131 @@ signing {
     }
 
     sign publishing.publications
+}
+
+// ─── Maven Central Portal auto-publish (Publisher API) ──────────────────────
+// The legacy OSSRH-compat endpoint (ossrh-staging-api.central.sonatype.com)
+// requires an extra "close" step before a deployment becomes visible at
+// https://central.sonatype.com/publishing/deployments, and then a second
+// manual click to actually release. The Central Portal Publisher API
+// eliminates both steps: one POST with ?publishingType=AUTOMATIC uploads
+// the bundle, validates it, and auto-transitions PUBLISHING → PUBLISHED.
+//
+// Usage: ./gradlew publishToMavenCentral
+//
+// Credentials — user token from https://central.sonatype.com/account
+// (these are the same credentials accepted by the OSSRH-compat endpoint;
+// any of the following is honored):
+//   centralPortalUsername  or  CENTRAL_PORTAL_USERNAME  or  ossrhUsername
+//   centralPortalPassword  or  CENTRAL_PORTAL_PASSWORD  or  ossrhPassword
+//
+// Reference: https://central.sonatype.org/publish/publish-portal-api/
+
+tasks.register('bundleForCentralPortal', Zip) {
+    group = "publishing"
+    description = "Bundle signed artifacts + .asc/.md5/.sha1 into a ZIP for the Central Portal Publisher API."
+    dependsOn 'publishMavenPublicationToCentralPortalStagingRepository'
+    archiveFileName = "${project.name}-${project.version}-bundle.zip"
+    destinationDirectory = layout.buildDirectory.dir("central-portal")
+    from layout.buildDirectory.dir("central-portal-staging")
+    // Portal rejects repository-level maven-metadata.xml inside deployment bundles.
+    exclude '**/maven-metadata.xml*'
+}
+
+tasks.register('publishToMavenCentral') {
+    group = "publishing"
+    description = "Upload bundle to Sonatype Central Portal with publishingType=AUTOMATIC; polls until PUBLISHED."
+    dependsOn 'bundleForCentralPortal'
+
+    doLast {
+        def tokenUser = findProperty("centralPortalUsername") ?:
+                        System.getenv("CENTRAL_PORTAL_USERNAME") ?:
+                        findProperty("ossrhUsername") ?:
+                        System.getenv("OSSRH_USERNAME")
+        def tokenPass = findProperty("centralPortalPassword") ?:
+                        System.getenv("CENTRAL_PORTAL_PASSWORD") ?:
+                        findProperty("ossrhPassword") ?:
+                        System.getenv("OSSRH_PASSWORD")
+        if (!tokenUser || !tokenPass) {
+            throw new GradleException(
+                "Central Portal credentials not set. Generate a user token at " +
+                "https://central.sonatype.com/account and set centralPortalUsername " +
+                "/ centralPortalPassword (or ossrhUsername / ossrhPassword).")
+        }
+
+        def bundleFile = tasks.bundleForCentralPortal.archiveFile.get().asFile
+        def deployName = "${project.group}:${project.name}:${project.version}"
+        def encName = URLEncoder.encode(deployName, 'UTF-8')
+        def auth = "Bearer " + Base64.encoder.encodeToString("${tokenUser}:${tokenPass}".bytes)
+
+        def uploadUrl = new URL("https://central.sonatype.com/api/v1/publisher/upload" +
+                "?name=${encName}&publishingType=AUTOMATIC")
+        def boundary = "----" + UUID.randomUUID().toString().replace("-", "")
+
+        println "Uploading ${bundleFile.name} (${bundleFile.length()} bytes) to Central Portal..."
+        HttpURLConnection conn = (HttpURLConnection) uploadUrl.openConnection()
+        conn.doOutput = true
+        conn.requestMethod = 'POST'
+        conn.setRequestProperty('Authorization', auth)
+        conn.setRequestProperty('Content-Type', "multipart/form-data; boundary=${boundary}")
+        conn.setChunkedStreamingMode(1024 * 1024)
+
+        conn.outputStream.withStream { os ->
+            os.write("--${boundary}\r\n".bytes)
+            os.write(("Content-Disposition: form-data; name=\"bundle\"; " +
+                      "filename=\"${bundleFile.name}\"\r\n").bytes)
+            os.write("Content-Type: application/octet-stream\r\n\r\n".bytes)
+            bundleFile.withInputStream { is -> os << is }
+            os.write("\r\n--${boundary}--\r\n".bytes)
+        }
+
+        int code = conn.responseCode
+        def body = (code < 400 ? conn.inputStream : conn.errorStream).text
+        if (code != 201 && code != 200) {
+            throw new GradleException("Central Portal upload failed: HTTP ${code}\n${body}")
+        }
+        def deployId = body.trim()
+        println "Upload accepted. Deployment ID: ${deployId}"
+        println "Tracking at https://central.sonatype.com/publishing/deployments"
+        println ""
+
+        // Poll deployment state until PUBLISHED (success) or FAILED (abort).
+        // With AUTOMATIC: PENDING → VALIDATING → PUBLISHING → PUBLISHED.
+        def statusUrl = new URL("https://central.sonatype.com/api/v1/publisher/status?id=${deployId}")
+        def deadline = System.currentTimeMillis() + 15 * 60 * 1000L
+        def lastState = null
+        while (System.currentTimeMillis() < deadline) {
+            HttpURLConnection sc = (HttpURLConnection) statusUrl.openConnection()
+            sc.requestMethod = 'POST'
+            sc.setRequestProperty('Authorization', auth)
+            int scode = sc.responseCode
+            def sbody = (scode < 400 ? sc.inputStream : sc.errorStream).text
+            if (scode >= 400) {
+                throw new GradleException("Status check failed: HTTP ${scode}\n${sbody}")
+            }
+            def m = (sbody =~ /"deploymentState"\s*:\s*"([A-Z_]+)"/)
+            if (m.find()) {
+                def cur = m.group(1)
+                if (cur != lastState) {
+                    println "  [${new Date().format('HH:mm:ss')}] ${cur}"
+                    lastState = cur
+                }
+                if (cur == 'PUBLISHED') {
+                    def groupPath = project.group.toString().replace('.', '/')
+                    println ""
+                    println "Released to Maven Central."
+                    println "  Repository: https://repo1.maven.org/maven2/${groupPath}/${project.name}/${project.version}/"
+                    println "  Search (may lag 2-4h): https://central.sonatype.com/artifact/${project.group}/${project.name}/${project.version}"
+                    return
+                }
+                if (cur == 'FAILED') {
+                    throw new GradleException("Deployment FAILED:\n${sbody}")
+                }
+            }
+            Thread.sleep(5000)
+        }
+        throw new GradleException("Timed out waiting for deployment ${deployId}; check the Portal dashboard.")
+    }
 }
 
 // ─── Custom tasks ────────────────────────────────────────────────────────────

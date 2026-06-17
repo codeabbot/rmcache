@@ -72,12 +72,19 @@ public final class BuiltInSerializers {
                 if (length != key.length()) {
                     return false;
                 }
+                int bits = 0;
                 for (int i = 0; i < length; i++) {
-                    if (segment.get(ValueLayout.JAVA_BYTE, offset + i) != (byte) key.charAt(i)) {
+                    char c = key.charAt(i);
+                    bits |= c;
+                    if (segment.get(ValueLayout.JAVA_BYTE, offset + i) != (byte) c) {
                         return false;
                     }
                 }
-                return true;
+                // A4: a char above U+00FF was truncated to a byte by the old code,
+                // which could spuriously match a stored Latin-1 key (e.g. 'U+0100'
+                // vs the NUL byte). Such a key is not representable in Latin-1, so
+                // it cannot legitimately match. OR-accumulate keeps the loop branch-free.
+                return (bits & 0xFF00) == 0;
             }
             // P3-O1 fix: Manual byte loop instead of MemorySegment.ofArray()
             // to avoid per-call allocation (same anti-pattern fixed by O2 in EntryPool).

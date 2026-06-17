@@ -3,32 +3,42 @@ slf4j = "2.0.12"
 logback = "1.5.12"
 micrometer-core = "1.14.0"
 
-# test dependencies
-jupiter = "5.11.0"
+# test dependencies — JUnit versions (Jupiter 5.x + Platform 1.x) are aligned
+# via the JUnit BOM (junit-bom) so they can never drift apart.
+junit = "5.11.0"
 assertj = "3.26.3"
 mockito = "5.14.2"
+
+# benchmark (jmh) dependencies
 jmh = "1.37"
 caffeine = "3.1.8"
 mapdb = "3.0.9"
 chronicleMap = "2026.1"
+ohc = "0.7.4"
+ehcache = "3.10.8"
 
 [libraries]
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
 micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "micrometer-core" }
 
-jupiter-api = { module = "org.junit.jupiter:junit-jupiter-api", version.ref = "jupiter" }
-jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine", version.ref = "jupiter" }
-jupiter-params = { module = "org.junit.jupiter:junit-jupiter-params", version.ref = "jupiter" }
+# JUnit — version managed by junit-bom (declared as a platform in build.gradle).
+junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }
+jupiter-api = { module = "org.junit.jupiter:junit-jupiter-api" }
+jupiter-engine = { module = "org.junit.jupiter:junit-jupiter-engine" }
+jupiter-params = { module = "org.junit.jupiter:junit-jupiter-params" }
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
 mockito-core = { module = "org.mockito:mockito-core", version.ref = "mockito" }
 mockito-junit-jupiter = { module = "org.mockito:mockito-junit-jupiter", version.ref = "mockito" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
 
 jmh-core = { module = "org.openjdk.jmh:jmh-core", version.ref = "jmh" }
 jmh-annproc = { module = "org.openjdk.jmh:jmh-generator-annprocess", version.ref = "jmh" }
 caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
 mapdb = { module = "org.mapdb:mapdb", version.ref = "mapdb" }
 chronicle-map = { module = "net.openhft:chronicle-map", version.ref = "chronicleMap" }
+ohc-core = { module = "org.caffinitas.ohc:ohc-core", version.ref = "ohc" }
+ehcache = { module = "org.ehcache:ehcache", version.ref = "ehcache" }
 
 [bundles]
 testing = ["jupiter-api", "jupiter-engine", "jupiter-params", "assertj-core", "mockito-core", "mockito-junit-jupiter", "logback-classic"]
