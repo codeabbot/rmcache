@@ -22,6 +22,8 @@ import com.codeabbot.rmcache.Units;
 import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import com.codeabbot.rmcache.serializer.StringEncoding;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import net.openhft.chronicle.map.ChronicleMap;
 import org.ehcache.CacheManager;
 import org.ehcache.config.builders.CacheConfigurationBuilder;
@@ -65,6 +67,7 @@ public class FairComparisonScaleBenchmark {
     private ChronicleMap<String, byte[]> chronicleMap;
     private org.ehcache.Cache<String, byte[]> ehcache;
     private CacheManager ehcacheManager;
+    private Cache<String, byte[]> caffeine;
 
     @Setup(Level.Trial)
     public void setup() throws IOException {
@@ -111,6 +114,9 @@ public class FairComparisonScaleBenchmark {
                                 .offheap(512, MemoryUnit.MB))
                         .build());
 
+        // ── Caffeine (on-heap reference; on-heap caps the achievable latency) ─
+        caffeine = Caffeine.newBuilder().maximumSize(entryCount * 2L).build();
+
         // ── Pre-populate ──────────────────────────────────────────────────────
         byte[] value = new byte[valueSize];
         for (int i = 0; i < entryCount; i++) {
@@ -120,6 +126,7 @@ public class FairComparisonScaleBenchmark {
             mapDBMap.put(key, value);
             chronicleMap.put(key, value);
             ehcache.put(key, value);
+            caffeine.put(key, value);
         }
         System.out.println("Setup complete for " + entryCount + " entries.\n");
     }
@@ -199,5 +206,19 @@ public class FairComparisonScaleBenchmark {
     public void ehcachePut() {
         int idx = ThreadLocalRandom.current().nextInt(entryCount);
         ehcache.put("key-" + idx, new byte[valueSize]);
+    }
+
+    // ── Caffeine GET / PUT (on-heap reference) ───────────────────────────────
+
+    @Benchmark
+    public byte[] caffeineGet() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        return caffeine.getIfPresent("key-" + idx);
+    }
+
+    @Benchmark
+    public void caffeinePut() {
+        int idx = ThreadLocalRandom.current().nextInt(entryCount);
+        caffeine.put("key-" + idx, new byte[valueSize]);
     }
 }
