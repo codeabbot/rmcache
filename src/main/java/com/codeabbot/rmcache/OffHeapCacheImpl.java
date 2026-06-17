@@ -683,32 +683,38 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         // AND the stored key-hash to still equal the lookup hash detects that race.
         // Reading the offset once (instead of re-reading it through getValueLen /
         // readValueToBuffer / readValue) also removes redundant volatile reads.
-        long off = entryPool.getOffset(slot);
+        // O2: opaque read — no acquire barrier on ARM. The dependent value reads
+        // below are address-ordered after this load on real hardware, and the
+        // post-copy re-read detects any change, so volatile ordering isn't needed.
+        long off = entryPool.getOffsetOpaque(slot);
         if (off == -1L)
             return null;
 
         if (isByteArrayValue) {
-            int valLen = entryPool.getValueLenAt(off);
-            byte[] vBuf = ctx.ensureCapacity(valLen);
-            entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
-            if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
+            // PERF: copy straight off-heap into the freshly-allocated result array
+            // (one copy + one allocation). The previous path copied twice per get:
+            // off-heap -> reusable thread-local buffer, then Arrays.copyOf -> result.
+            byte[] result = entryPool.readValueAt(off);
+            if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             @SuppressWarnings("unchecked")
-            V res = (V) Arrays.copyOf(vBuf, valLen);
+            V res = (V) result;
             return res;
         }
 
         if (cachedStreamSer != null) {
+            // Streaming keeps the reusable buffer (deserializeFrom reads from it; no
+            // result array is allocated), so the intermediate copy is not wasted here.
             int valLen = entryPool.getValueLenAt(off);
             byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
-            if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
+            if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
                 return null;
             return cachedStreamSer.deserializeFrom(vBuf, 0, valLen);
         }
 
         byte[] valBytes = entryPool.readValueAt(off);
-        if (entryPool.getOffset(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
+        if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
             return null;
         return valueSerializer.deserialize(valBytes);
     }
