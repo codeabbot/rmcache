@@ -355,8 +355,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
-        CacheContext ctx = context.get();
-
         int existingSlot = 0;
         byte[] keyBytes = null;
         int keyLen = 0;
@@ -393,6 +391,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (segSer != null) {
             valueMaxLen = Math.max(0, segSer.estimateSize(value));
         } else if (streamSer != null) {
+            // PERF: the per-thread scratch buffer is only needed by the streaming
+            // serializer, so fetch the ThreadLocal lazily here rather than up front
+            // (the byte[]/segment hot path never touches it).
+            CacheContext ctx = context.get();
             int estimate = Math.max(0, streamSer.estimateSize(value));
             byte[] buf = ctx.ensureCapacity(estimate);
             valueLen = streamSer.serializeTo(value, buf, 0);
@@ -599,7 +601,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (closed)
             return null;
 
-        CacheContext ctx = context.get();
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         if (hasGhostCache) {
@@ -664,7 +665,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         globalHits.increment();
         evictionPolicy.onAccess(slot, keyHash);
 
-        V result = readValueFromSlot(slot, keyHash, ctx);
+        V result = readValueFromSlot(slot, keyHash);
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, result);
@@ -674,7 +675,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return result;
     }
 
-    private V readValueFromSlot(int slot, int keyHash, CacheContext ctx) {
+    private V readValueFromSlot(int slot, int keyHash) {
         // A2 (ABA guard) + hot-path read reduction: read the block offset ONCE,
         // copy the value through that snapshot, then validate. The prior C1/C3
         // guard only re-checked "freed" (offset == -1); a slot freed AND reused by
@@ -706,6 +707,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             // Streaming keeps the reusable buffer (deserializeFrom reads from it; no
             // result array is allocated), so the intermediate copy is not wasted here.
             int valLen = entryPool.getValueLenAt(off);
+            CacheContext ctx = context.get();
             byte[] vBuf = ctx.ensureCapacity(valLen);
             entryPool.readValueToBufferAt(off, vBuf, 0, valLen);
             if (entryPool.getOffsetOpaque(slot) != off || entryPool.getKeyHashAt(off) != keyHash)
