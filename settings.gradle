@@ -12,6 +12,7 @@ plugins {
 
 rootProject.name = 'rmcache'
 include 'examples'
+include 'rmcache-metrics'
 include 'rmcache-micrometer'
 include 'rmcache-opentelemetry'
 

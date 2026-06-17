@@ -1,0 +1,42 @@
+plugins {
+    id 'java-library'
+    id 'me.champeau.jmh'
+}
+
+group = "com.codeabbot"
+version = "0.0.2"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    api project(':')
+
+    jmh libs.jmh.core
+    jmh libs.jmh.annproc
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.bundles.testing
+    testRuntimeOnly libs.junit.platform.launcher
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+}
+
+jmh {
+    iterations = 2
+    warmupIterations = 1
+    fork = 1
+    threads = 4
+    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Xmx6g"]
+    resultFormat = "text"
+}
