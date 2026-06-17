@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.0.2] - 2026-06-17
+
 ### Added
+- **Peer benchmark suite** — `FairComparisonScaleBenchmark` now compares RMCache (plain + OFF_HEAP GhostCache) against Caffeine (on-heap reference), Chronicle Map, OHC, MapDB, and EhCache in one internally-consistent run; new `OHCComparisonBenchmark` isolates OHC's `Unsafe`-based allocator. Results published in the README.
+- **Open-source governance** — `NOTICE`, `CLA.md` (Contributor License Agreement enabling the open-core model), GitHub issue/PR templates, `CODEOWNERS`, and Dependabot configuration.
 - **`examples/` subproject** — 5 runnable examples: `BasicCacheExample`, `TTLExample`, `ZeroCopyExample`, `EvictionExample`, `CustomSerializerExample`. Run via `./gradlew :examples:run<Name>`.
 - **JaCoCo coverage reporting** — `jacocoTestReport` task (HTML + XML) with 65% instruction coverage minimum (`jacocoTestCoverageVerification`). Baseline: 66.6% instruction, 67.9% line.
 - **MapDB and ChronicleMap as benchmark competitors** — replace NMA in `FairComparisonScaleBenchmark`, `ComparativeWorkloadBenchmark`, `ThroughputBenchmark`, and `MemoryScalabilitySuite`.
@@ -27,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/heap-profile.md`** — heap breakdown, zero-heap profiles, 1B-entry scale projection
 
 ### Changed
+- **Build dependency management** — every dependency now declared through the Gradle version catalog (`gradle/libs.versions.toml`); JUnit (Jupiter + Platform) versions aligned via the JUnit BOM to prevent drift.
 - **JDK requirement raised to 25+ (LTS)** — build config, CI matrix, all documentation updated
 - **`entryCount` rename** — `_size` field renamed to `entryCount` in `LRUPolicy` and `TTLPolicy` for readability
 - **`BackgroundEvictionTest`** — replaced busy-sleep (20×10ms polling) with deadline-based polling (2s window, 5ms sleep)
@@ -45,20 +52,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-4 threads, JDK 25.0.2, macOS (`FairComparisonScaleBenchmark`, JMH, 2 warmup + 3 iterations):
+4 threads, JDK 25, macOS, 256 B values (`FairComparisonScaleBenchmark` + `OHCComparisonBenchmark`, JMH `AverageTime`, all caches measured in one run). Lower is better.
 
-| Operation | Scale | RMCache | RMCache+Ghost | ChronicleMap | MapDB | EhCache |
-|-----------|-------|---------|---------------|--------------|-------|---------|
-| GET | 10 K | **110 ns** | 143 ns | 257 ns | 1,255 ns | 1,908 ns |
-| GET | 100 K | **363 ns** | 382 ns | 336 ns | 1,660 ns | 2,163 ns |
-| GET | 1 M | 543 ns | **524 ns** | 489 ns | 1,958 ns | 2,365 ns |
-| PUT | 10 K | 151 ns | **122 ns** | 556 ns | 3,068 ns | 3,331 ns |
-| PUT | 100 K | 357 ns | **297 ns** | 688 ns | 8,831 ns | 2,829 ns |
-| PUT | 1 M | 486 ns | **479 ns** | 751 ns | 4,809 ns | 2,909 ns |
+GET (ns/op):
+
+| Cache | 10K | 100K | 1M |
+|-------|----:|-----:|---:|
+| RMCache | 107 | 257 | 424 |
+| RMCache+Ghost | 126 | 236 | 413 |
+| Chronicle Map | 251 | 305 | 445 |
+| OHC | 284 | 430 | 629 |
+| MapDB | 1,098 | 1,731 | 2,214 |
+| EhCache | 1,639 | 1,765 | 2,003 |
+| _Caffeine (on-heap ref.)_ | _65_ | _105_ | _254_ |
+
+PUT (ns/op):
+
+| Cache | 10K | 100K | 1M |
+|-------|----:|-----:|---:|
+| RMCache+Ghost | 130 | 278 | 474 |
+| RMCache | 169 | 320 | 488 |
+| Chronicle Map | 603 | 622 | 715 |
+| OHC | 426 | 595 | 1,044 |
+| EhCache | 2,460 | 2,740 | 3,095 |
+| MapDB | 2,621 | 4,205 | 4,660 |
+| _Caffeine (on-heap ref.)_ | _152_ | _248_ | _511_ |
+
+RMCache is the fastest off-heap cache measured — faster than Chronicle Map, OHC, MapDB, and EhCache at every scale on both GET and PUT. On PUT it stays within range of on-heap Caffeine despite living entirely off-heap. Caffeine is listed only as an on-heap reference point, not a direct competitor.
 
 ---
 
-## [1.0.0] - 2026-03-04
+## [0.0.1] - 2026-03-04
 
 ### Added
 - **Off-heap cache engine** built on Java Foreign Function & Memory (FFM) API — zero `Unsafe` dependency
@@ -84,7 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`putIfAbsent`**, **`putAll`**, **`getAll`**, **`putAsync`**, **`getAsync`** bulk and async APIs
 - **`cleanupThreadLocals()`** static method for thread-pool thread retirement
 
-### Performance (initial v1.0 baseline)
+### Performance (initial 0.0.1 baseline)
 
 4 threads, JDK 25, macOS:
 

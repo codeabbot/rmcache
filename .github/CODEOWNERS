@@ -1,0 +1,7 @@
+# Code owners are automatically requested for review on pull requests.
+# https://docs.github.com/articles/about-code-owners
+#
+# NOTE: replace @codeabbot with the GitHub username (or @org/team) that owns the
+# repository if it differs from the repository namespace.
+
+*       @codeabbot
