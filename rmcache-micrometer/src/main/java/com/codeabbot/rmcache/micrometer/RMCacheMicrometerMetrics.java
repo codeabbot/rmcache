@@ -36,8 +36,8 @@ import io.micrometer.core.instrument.binder.cache.CacheMeterBinder;
  * {@code cache.evictions}), plus RMCache extras: {@code cache.memory.used},
  * {@code cache.memory.max}, and {@code cache.evictions.cause} tagged by cause.
  *
- * <p>{@code cache.puts} stays flat for now — RMCache does not yet expose a put counter
- * (that arrives with the Tier 1 metrics work). All other metrics are accurate today.
+ * <p>{@code cache.puts} and {@code cache.removes} come straight from {@code getStats()};
+ * all counts are accurate.
  *
  * <pre>{@code
  * RMCacheMicrometerMetrics.monitor(registry, cache, "users");
@@ -92,13 +92,16 @@ public class RMCacheMicrometerMetrics extends CacheMeterBinder<OffHeapCache<?, ?
 
     @Override
     protected long putCount() {
-        // RMCache exposes no put counter yet (Tier 1). Report 0 rather than something
-        // misleading; cache.puts simply stays flat until the put counter lands.
-        return 0L;
+        return cache.getStats().puts();
     }
 
     @Override
     protected void bindImplementationSpecificMetrics(MeterRegistry registry) {
+        FunctionCounter.builder("cache.removes", cache, c -> c.getStats().removes())
+                .tags(cacheTags)
+                .description("Cache remove operations")
+                .register(registry);
+
         Gauge.builder("cache.memory.used", cache, c -> c.getStats().memoryUsedBytes())
                 .tags(cacheTags)
                 .description("Off-heap memory currently used by the cache")

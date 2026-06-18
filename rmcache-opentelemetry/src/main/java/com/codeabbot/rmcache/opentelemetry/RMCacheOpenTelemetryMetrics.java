@@ -32,9 +32,10 @@ import java.util.List;
  * interval), never on the cache's {@code get}/{@code put} path. Registering them cannot
  * regress cache latency.
  *
- * <p>Emits {@code cache.gets} (attribute {@code result=hit|miss}), {@code cache.evictions}
- * (attribute {@code cause=size|ttl|explicit}), {@code cache.size}, {@code cache.memory.used},
- * and {@code cache.memory.max}, each tagged with the {@code cache} name attribute.
+ * <p>Emits {@code cache.gets} (attribute {@code result=hit|miss}), {@code cache.puts},
+ * {@code cache.removes}, {@code cache.evictions} (attribute {@code cause=size|ttl|explicit}),
+ * {@code cache.size}, {@code cache.memory.used}, and {@code cache.memory.max}, each tagged
+ * with the {@code cache} name attribute.
  *
  * <pre>{@code
  * AutoCloseable handle = RMCacheOpenTelemetryMetrics.register(meter, cache, "users");
@@ -70,6 +71,14 @@ public final class RMCacheOpenTelemetryMetrics {
                     m.record(s.hits(), base.toBuilder().put(RESULT, "hit").build());
                     m.record(s.misses(), base.toBuilder().put(RESULT, "miss").build());
                 }));
+
+        instruments.add(meter.counterBuilder("cache.puts")
+                .setDescription("Cache put operations")
+                .buildWithCallback(m -> m.record(cache.getStats().puts(), base)));
+
+        instruments.add(meter.counterBuilder("cache.removes")
+                .setDescription("Cache remove operations")
+                .buildWithCallback(m -> m.record(cache.getStats().removes(), base)));
 
         instruments.add(meter.counterBuilder("cache.evictions")
                 .setDescription("Cache evictions by cause")

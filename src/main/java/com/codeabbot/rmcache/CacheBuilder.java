@@ -63,8 +63,6 @@ public class CacheBuilder<K, V> {
 
     private String cacheName = "rmcache";
 
-    private MetricsRecorder metricsRecorder = MetricsRecorder.NOOP;
-
     private boolean backgroundEviction = true;
     private long backgroundEvictionIntervalMs = 10;
     private double evictionHighWatermark = 0.95d;
@@ -265,16 +263,6 @@ public class CacheBuilder<K, V> {
         return this;
     }
 
-    /**
-     * Plug in a {@link MetricsRecorder} to count puts/removes inside the cache.
-     * Defaults to {@link MetricsRecorder#NOOP} (zero cost — the hooks inline away).
-     * See the {@code rmcache-metrics} module for a ready-made counting recorder.
-     */
-    public CacheBuilder<K, V> metricsRecorder(MetricsRecorder recorder) {
-        this.metricsRecorder = (recorder == null) ? MetricsRecorder.NOOP : recorder;
-        return this;
-    }
-
     public CacheBuilder<K, V> evictionFilter(EvictionFilter<K> filter) {
         this.evictionFilter = filter;
         return this;
@@ -429,7 +417,7 @@ public class CacheBuilder<K, V> {
                     evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
                     asyncExecutor,
                     backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark,
-                    cacheName, metricsRecorder);
+                    cacheName);
             return cache;
         } catch (Throwable t) {
             // Clean up partially allocated native resources

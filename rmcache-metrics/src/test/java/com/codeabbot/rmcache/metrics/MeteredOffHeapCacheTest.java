@@ -44,26 +44,7 @@ class MeteredOffHeapCacheTest {
     }
 
     @Test
-    void countsHitsMissesPutsRemoves() {
-        MeteredOffHeapCache<String, byte[]> cache = new MeteredOffHeapCache<>(core);
-
-        cache.put("a", new byte[]{1});
-        cache.put("b", new byte[]{2});
-        assertThat(cache.get("a")).isNotNull();   // hit
-        assertThat(cache.get("zzz")).isNull();    // miss
-        assertThat(cache.remove("a")).isTrue();
-
-        CacheMetricsSnapshot s = cache.snapshot();
-        assertThat(s.puts()).isEqualTo(2);
-        assertThat(s.hits()).isEqualTo(1);
-        assertThat(s.misses()).isEqualTo(1);
-        assertThat(s.gets()).isEqualTo(2);
-        assertThat(s.removes()).isEqualTo(1);
-        assertThat(s.hitRate()).isEqualTo(0.5);
-    }
-
-    @Test
-    void countingOnlyDoesNotSampleLatency() {
+    void passThroughDoesNotSample() {
         MeteredOffHeapCache<String, byte[]> cache = new MeteredOffHeapCache<>(core); // rate 0
         cache.put("a", new byte[]{1});
         cache.get("a");
@@ -84,19 +65,17 @@ class MeteredOffHeapCacheTest {
     }
 
     @Test
-    void putIfAbsentCountsOnlyOnInsert() {
-        MeteredOffHeapCache<String, byte[]> cache = new MeteredOffHeapCache<>(core);
-        assertThat(cache.putIfAbsent("a", new byte[]{1})).isTrue();
-        assertThat(cache.putIfAbsent("a", new byte[]{2})).isFalse(); // already present
-        assertThat(cache.snapshot().puts()).isEqualTo(1);
-    }
-
-    @Test
-    void delegatesValueCorrectly() {
+    void delegatesValuesAndSurfacesCoreCounts() {
         MeteredOffHeapCache<String, byte[]> cache = new MeteredOffHeapCache<>(core);
         cache.put("a", new byte[]{1, 2, 3});
         assertThat(cache.get("a")).isEqualTo(new byte[]{1, 2, 3});
         assertThat(cache.size()).isEqualTo(1);
         assertThat(cache.contains("a")).isTrue();
+        assertThat(cache.remove("a")).isTrue();
+
+        // Counts now come from the core's getStats(), surfaced through the decorator.
+        OffHeapCache.CacheStats stats = cache.getStats();
+        assertThat(stats.puts()).isEqualTo(1);
+        assertThat(stats.removes()).isEqualTo(1);
     }
 }

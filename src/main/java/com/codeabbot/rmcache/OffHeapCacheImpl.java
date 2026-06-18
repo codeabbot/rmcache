@@ -97,10 +97,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final EvictionFilter<K> evictionFilter;
     private final GhostCache<K, V> ghostCache;
     private final OffHeapGhostCache offHeapGhostCache;
-    private final MetricsRecorder metrics;
 
     private final LongAdder globalHits = new LongAdder();
     private final LongAdder globalMisses = new LongAdder();
+    private final LongAdder globalPuts = new LongAdder();
+    private final LongAdder globalRemoves = new LongAdder();
     private final LongAdder globalEvictions = new LongAdder();
     private final LongAdder evictionsBySize = new LongAdder();
     private final LongAdder evictionsByTtl = new LongAdder();
@@ -190,8 +191,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
             double evictionLowWatermark,
-            String cacheName,
-            MetricsRecorder metrics) {
+            String cacheName) {
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init start");
         }
@@ -231,7 +231,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.evictionHighWatermark = evictionHighWatermark;
         this.evictionLowWatermark = evictionLowWatermark;
         this.cacheName = (cacheName == null || cacheName.isEmpty()) ? "rmcache" : cacheName;
-        this.metrics = (metrics == null) ? MetricsRecorder.NOOP : metrics;
 
         long defTTL = evictionPolicy.getDefaultTTLMs();
         this.defaultTTLMs = defTTL;
@@ -349,7 +348,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             throw new IllegalStateException("Closed");
 
         putInternal(key, value, ttl, priority);
-        metrics.onPut();
+        globalPuts.increment();
     }
 
     private void putInternal(K key, V value, Duration ttl, short priority) {
@@ -757,7 +756,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         removeInternal(keyHash, keyBytes, keyLen, slot, EvictionCause.EXPLICIT);
-        metrics.onRemove();
+        globalRemoves.increment();
         return true;
     }
 
@@ -771,7 +770,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         checkNotClosed();
         boolean inserted = putInternal(key, value, ttl, (short) 0, true);
         if (inserted) {
-            metrics.onPut();
+            globalPuts.increment();
         }
         return inserted;
     }
@@ -886,6 +885,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return new CacheStats(
                 globalHits.sum(),
                 globalMisses.sum(),
+                globalPuts.sum(),
+                globalRemoves.sum(),
                 globalEvictions.sum(),
                 size(),
                 allocator.getUsedBytes(),

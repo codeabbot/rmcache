@@ -29,28 +29,22 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
 
 /**
- * A metrics decorator over any {@link OffHeapCache} that records operation counts and
- * (optionally) sampled latency, with a deliberately tiny per-operation cost.
+ * A latency-sampling decorator over any {@link OffHeapCache}.
  *
- * <p><b>Tier 1 — opt-in.</b> You only pay for it if you wrap your cache in it. The core
- * cache is never modified.
- *
- * <p><b>Counting</b> uses {@link LongAdder}s, which stripe across threads and stay
- * contention-free under load — each instrumented operation adds a single increment.
- * <b>Latency</b> is measured only on a 1-in-{@code latencySampleRate} sample (two
+ * <p><b>Tier 1 — opt-in.</b> Operation counts (hits, misses, puts, removes, evictions,
+ * size, memory) are already tracked by the core and exposed via
+ * {@link OffHeapCache#getStats()}. This decorator adds the one thing stats cannot give you:
+ * <b>per-call latency</b>, measured on a 1-in-{@code latencySampleRate} sample (two
  * {@code System.nanoTime()} calls), so the amortized timing cost is roughly
- * {@code 2 * nanoTime / sampleRate}. With {@code latencySampleRate = 0} (the default),
- * no timing is performed at all and the sampling branch short-circuits.
+ * {@code 2 * nanoTime / sampleRate}. With {@code latencySampleRate = 0} (the default) no
+ * timing is done and the decorator is a thin pass-through.
  *
- * <p>Read {@link #snapshot()} off the hot path (e.g. from a metrics exporter) to obtain
- * counts and sampled-latency aggregates. The underlying {@link #getStats()} is still
- * available for the core hit/miss/eviction/memory figures.
+ * <p>Read {@link #snapshot()} off the hot path for sampled-latency aggregates; use the
+ * delegated {@link #getStats()} for the core counts.
  *
  * <pre>{@code
- * OffHeapCache<String, byte[]> cache =
- *     new MeteredOffHeapCache<>(coreCache);          // counting only
  * OffHeapCache<String, byte[]> sampled =
- *     new MeteredOffHeapCache<>(coreCache, 1024);    // + 1-in-1024 latency sampling
+ *     new MeteredOffHeapCache<>(coreCache, 1024); // 1-in-1024 latency sampling
  * }</pre>
  *
  * @param <K> key type
@@ -61,25 +55,21 @@ public final class MeteredOffHeapCache<K, V> implements OffHeapCache<K, V> {
     private final OffHeapCache<K, V> delegate;
     private final int latencySampleRate;
 
-    private final LongAdder hits = new LongAdder();
-    private final LongAdder misses = new LongAdder();
-    private final LongAdder puts = new LongAdder();
-    private final LongAdder removes = new LongAdder();
     private final LongAdder sampledOps = new LongAdder();
     private final LongAdder sampledNanosSum = new LongAdder();
     private final AtomicLong maxLatencyNanos = new AtomicLong();
 
-    /** Wrap {@code delegate} with counting only (no latency timing). */
+    /** Wrap {@code delegate} as a thin pass-through (no latency timing). */
     public MeteredOffHeapCache(OffHeapCache<K, V> delegate) {
         this(delegate, 0);
     }
 
     /**
-     * Wrap {@code delegate} with counting and optional latency sampling.
+     * Wrap {@code delegate} with optional latency sampling.
      *
      * @param delegate          the cache to instrument
-     * @param latencySampleRate sample 1 in every {@code latencySampleRate} operations for
-     *                          latency; {@code 0} disables latency timing entirely
+     * @param latencySampleRate sample 1 in every {@code latencySampleRate} operations;
+     *                          {@code 0} disables timing entirely
      */
     public MeteredOffHeapCache(OffHeapCache<K, V> delegate, int latencySampleRate) {
         if (latencySampleRate < 0) {
@@ -89,19 +79,15 @@ public final class MeteredOffHeapCache<K, V> implements OffHeapCache<K, V> {
         this.latencySampleRate = latencySampleRate;
     }
 
-    /** Aggregated counters and sampled-latency figures for this decorator. */
+    /** Sampled-latency figures for this decorator. Counts live in {@link #getStats()}. */
     public CacheMetricsSnapshot snapshot() {
-        return new CacheMetricsSnapshot(
-                hits.sum(), misses.sum(), puts.sum(), removes.sum(),
-                sampledOps.sum(), sampledNanosSum.sum(), maxLatencyNanos.get());
+        return new CacheMetricsSnapshot(sampledOps.sum(), sampledNanosSum.sum(), maxLatencyNanos.get());
     }
 
     /** The wrapped cache. */
     public OffHeapCache<K, V> delegate() {
         return delegate;
     }
-
-    // ── instrumented hot-path operations ─────────────────────────────────────
 
     private boolean shouldSample() {
         return latencySampleRate > 0 && ThreadLocalRandom.current().nextInt(latencySampleRate) == 0;
@@ -114,97 +100,85 @@ public final class MeteredOffHeapCache<K, V> implements OffHeapCache<K, V> {
         maxLatencyNanos.accumulateAndGet(d, Math::max);
     }
 
+    // ── latency-sampled hot-path operations ──────────────────────────────────
+
     @Override
     public V get(K key) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
+        if (!shouldSample()) {
+            return delegate.get(key);
+        }
+        long t0 = System.nanoTime();
         V v = delegate.get(key);
-        if (sample) {
-            recordLatency(t0);
-        }
-        if (v != null) {
-            hits.increment();
-        } else {
-            misses.increment();
-        }
+        recordLatency(t0);
         return v;
     }
 
     @Override
     public void put(K key, V value) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
-        delegate.put(key, value);
-        if (sample) {
-            recordLatency(t0);
+        if (!shouldSample()) {
+            delegate.put(key, value);
+            return;
         }
-        puts.increment();
+        long t0 = System.nanoTime();
+        delegate.put(key, value);
+        recordLatency(t0);
     }
 
     @Override
     public void put(K key, V value, Duration ttl) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
-        delegate.put(key, value, ttl);
-        if (sample) {
-            recordLatency(t0);
+        if (!shouldSample()) {
+            delegate.put(key, value, ttl);
+            return;
         }
-        puts.increment();
+        long t0 = System.nanoTime();
+        delegate.put(key, value, ttl);
+        recordLatency(t0);
     }
 
     @Override
     public void put(K key, V value, short priority) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
-        delegate.put(key, value, priority);
-        if (sample) {
-            recordLatency(t0);
+        if (!shouldSample()) {
+            delegate.put(key, value, priority);
+            return;
         }
-        puts.increment();
+        long t0 = System.nanoTime();
+        delegate.put(key, value, priority);
+        recordLatency(t0);
     }
 
     @Override
     public void put(K key, V value, Duration ttl, short priority) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
-        delegate.put(key, value, ttl, priority);
-        if (sample) {
-            recordLatency(t0);
+        if (!shouldSample()) {
+            delegate.put(key, value, ttl, priority);
+            return;
         }
-        puts.increment();
+        long t0 = System.nanoTime();
+        delegate.put(key, value, ttl, priority);
+        recordLatency(t0);
     }
 
     @Override
     public boolean remove(K key) {
-        boolean sample = shouldSample();
-        long t0 = sample ? System.nanoTime() : 0L;
-        boolean removed = delegate.remove(key);
-        if (sample) {
-            recordLatency(t0);
+        if (!shouldSample()) {
+            return delegate.remove(key);
         }
-        removes.increment();
+        long t0 = System.nanoTime();
+        boolean removed = delegate.remove(key);
+        recordLatency(t0);
         return removed;
     }
 
+    // ── delegated operations ─────────────────────────────────────────────────
+
     @Override
     public boolean putIfAbsent(K key, V value) {
-        boolean inserted = delegate.putIfAbsent(key, value);
-        if (inserted) {
-            puts.increment();
-        }
-        return inserted;
+        return delegate.putIfAbsent(key, value);
     }
 
     @Override
     public boolean putIfAbsent(K key, V value, Duration ttl) {
-        boolean inserted = delegate.putIfAbsent(key, value, ttl);
-        if (inserted) {
-            puts.increment();
-        }
-        return inserted;
+        return delegate.putIfAbsent(key, value, ttl);
     }
-
-    // ── delegated operations (not separately metered in Tier 1) ──────────────
 
     @Override
     public V computeIfAbsent(K key, Function<K, V> loader) {

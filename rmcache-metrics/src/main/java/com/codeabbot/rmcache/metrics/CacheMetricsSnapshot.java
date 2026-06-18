@@ -16,40 +16,22 @@
 package com.codeabbot.rmcache.metrics;
 
 /**
- * Immutable point-in-time snapshot of {@link MeteredOffHeapCache} counters.
+ * Immutable point-in-time snapshot of {@link MeteredOffHeapCache}'s sampled-latency figures.
  *
- * <p>Counts that the core {@code CacheStats} does not provide — {@code puts},
- * {@code removes}, and per-call latency — are tracked by the decorator. Latency is
- * <em>sampled</em> (1-in-N operations), so {@link #sampledOps()} is the sample count, not
- * the total op count; {@link #meanSampledLatencyNanos()} is the mean over those samples.
+ * <p>Operation counts (hits, misses, puts, removes, evictions, size, memory) are <b>not</b>
+ * here — they come directly from {@code cache.getStats()}. This decorator's only job is
+ * per-call latency, measured on a 1-in-N sample, so {@link #sampledOps()} is the sample
+ * count (not the total op count) and {@link #meanSampledLatencyNanos()} is the mean over
+ * those samples.
  *
- * @param hits             gets that returned a value
- * @param misses           gets that returned {@code null}
- * @param puts             successful put / putIfAbsent operations
- * @param removes          remove operations
  * @param sampledOps       number of operations whose latency was sampled
  * @param sampledNanosSum  sum of sampled latencies, in nanoseconds
  * @param maxLatencyNanos  maximum observed sampled latency, in nanoseconds
  */
 public record CacheMetricsSnapshot(
-        long hits,
-        long misses,
-        long puts,
-        long removes,
         long sampledOps,
         long sampledNanosSum,
         long maxLatencyNanos) {
-
-    /** Total gets ({@code hits + misses}). */
-    public long gets() {
-        return hits + misses;
-    }
-
-    /** Hit ratio in [0,1]; 0 when there have been no gets. */
-    public double hitRate() {
-        long total = hits + misses;
-        return (total == 0) ? 0.0 : (double) hits / total;
-    }
 
     /** Mean sampled latency in nanoseconds; 0 when nothing was sampled. */
     public double meanSampledLatencyNanos() {
