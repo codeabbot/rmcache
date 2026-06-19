@@ -237,7 +237,14 @@ signing {
 tasks.register('bundleForCentralPortal', Zip) {
     group = "publishing"
     description = "Bundle signed artifacts + .asc/.md5/.sha1 into a ZIP for the Central Portal Publisher API."
-    dependsOn 'publishMavenPublicationToCentralPortalStagingRepository'
+    // Gather the root jar AND every published module into the one bundle (Central Portal accepts
+    // a single archive containing multiple components). All modules publish into this same
+    // central-portal-staging dir via gradle/maven-publish-conventions.gradle.
+    dependsOn 'publishMavenPublicationToCentralPortalStagingRepository',
+              ':rmcache-metrics:publishMavenPublicationToCentralPortalStagingRepository',
+              ':rmcache-micrometer:publishMavenPublicationToCentralPortalStagingRepository',
+              ':rmcache-opentelemetry:publishMavenPublicationToCentralPortalStagingRepository',
+              ':rmcache-jcache:publishMavenPublicationToCentralPortalStagingRepository'
     archiveFileName = "${project.name}-${project.version}-bundle.zip"
     destinationDirectory = layout.buildDirectory.dir("central-portal")
     from layout.buildDirectory.dir("central-portal-staging")
