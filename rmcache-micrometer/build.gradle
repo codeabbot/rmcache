@@ -4,12 +4,15 @@ plugins {
 
 group = "com.codeabbot"
 version = "0.0.2"
+description = "RMCache Micrometer binder: exposes cache statistics as Micrometer meters"
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
 }
+
+apply from: "$rootDir/gradle/maven-publish-conventions.gradle"
 
 repositories {
     mavenCentral()

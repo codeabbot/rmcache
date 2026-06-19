@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Metrics integrations** — `rmcache-micrometer` (Micrometer `CacheMeterBinder`) and `rmcache-opentelemetry` (OpenTelemetry observable instruments) expose cache statistics with **zero hot-path cost** (pull-based; read `getStats()` only on the collection/export interval). `rmcache-metrics` adds `MeteredOffHeapCache`, an opt-in latency-sampling decorator. See [docs/metrics.md](docs/metrics.md).
+- **JCache (JSR-107) provider** — `rmcache-jcache` is a standard `javax.cache` provider (drop-in for Spring Cache / Hibernate L2): store-by-value, atomic `invoke` via per-key striped locks, `ExpiryPolicy`→TTL, and JMX statistics. See [docs/jcache.md](docs/jcache.md).
+- **Multi-module Maven Central publishing** — all modules (`rmcache-metrics`, `-micrometer`, `-opentelemetry`, `-jcache`) are now signed and published alongside the core in a single Central Portal deployment bundle (`gradle/maven-publish-conventions.gradle`).
+
+### Fixed
+- **`maxEntries` is now a hard residency cap.** With background eviction enabled, the async drain could lag behind a write burst and let the cache grow to the *memory* limit instead of `maxEntries` (~6× overshoot observed at small caps). The new-key insert path now also evicts synchronously while over the cap, so `maxEntries` is a real bound. Eviction quality (hit rate) verified on par with Caffeine's W-TinyLFU.
 
 ## [0.0.2] - 2026-06-17
 

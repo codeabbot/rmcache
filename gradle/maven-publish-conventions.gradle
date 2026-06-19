@@ -1,0 +1,98 @@
+/*
+ * Shared Maven Central (Sonatype Central Portal) publishing + signing convention for the
+ * publishable RMCache modules (rmcache-metrics, -micrometer, -opentelemetry, -jcache).
+ *
+ * Each module emits a signed jar + sources + javadoc + pom into the SHARED root
+ * `central-portal-staging` directory. The root's `bundleForCentralPortal` task then zips that
+ * one directory (root jar + all module jars, in Maven layout) into a single Publisher-API
+ * bundle, and `publishToMavenCentral` uploads it. The root project keeps its own (tested)
+ * publishing block; this convention only adds the modules to the same release.
+ *
+ * Applied from a module build.gradle via:
+ *   apply from: "$rootDir/gradle/maven-publish-conventions.gradle"
+ * (set `description` first so it flows into the POM).
+ */
+
+apply plugin: 'maven-publish'
+apply plugin: 'signing'
+
+java {
+    withSourcesJar()
+    withJavadocJar()
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            pom {
+                name = project.name
+                description = project.description ?: "RMCache module: ${project.name}"
+                url = "https://github.com/codeabbot/rmcache"
+                licenses {
+                    license {
+                        name = "The Apache License, Version 2.0"
+                        url = "http://www.apache.org/licenses/LICENSE-2.0.txt"
+                    }
+                }
+                developers {
+                    developer {
+                        id = "rabindrameher"
+                        name = "Rabindra Meher"
+                        email = "maintainers@codeabbot.com"
+                    }
+                }
+                scm {
+                    connection = "scm:git:git://github.com/codeabbot/rmcache.git"
+                    developerConnection = "scm:git:ssh://github.com/codeabbot/rmcache.git"
+                    url = "https://github.com/codeabbot/rmcache"
+                }
+            }
+        }
+    }
+    repositories {
+        maven {
+            name = "OSSRH"
+            def defaultRelease = "https://ossrh-staging-api.central.sonatype.com/service/local/staging/deploy/maven2/"
+            def defaultSnapshot = "https://central.sonatype.com/repository/maven-snapshots/"
+            def releaseUrl = findProperty("sonatypeReleaseUrl") ?: System.getenv("SONATYPE_RELEASE_URL") ?: defaultRelease
+            def snapshotUrl = findProperty("sonatypeSnapshotUrl") ?: System.getenv("SONATYPE_SNAPSHOT_URL") ?: defaultSnapshot
+            url = uri(version.toString().endsWith("-SNAPSHOT") ? snapshotUrl : releaseUrl)
+            credentials {
+                username = findProperty("ossrhUsername") ?: System.getenv("OSSRH_USERNAME") ?: ""
+                password = findProperty("ossrhPassword") ?: System.getenv("OSSRH_PASSWORD") ?: ""
+            }
+        }
+        maven {
+            // File-based staging shared with the root project so every module lands in the
+            // same Maven tree and the root's bundleForCentralPortal can zip them all together.
+            name = "CentralPortalStaging"
+            url = rootProject.layout.buildDirectory.dir("central-portal-staging").get().asFile.toURI()
+        }
+    }
+}
+
+signing {
+    required { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
+
+    def signingKey = findProperty("signingKey") ?: System.getenv("SIGNING_KEY")
+    def signingPassword = findProperty("signingPassword") ?: System.getenv("SIGNING_PASSWORD")
+    def rawKeyId = findProperty("signingKeyId") ?: System.getenv("SIGNING_KEY_ID") ?: findProperty("signing.keyId")
+
+    def signingKeyId = rawKeyId?.toString()?.replaceFirst(/^0x/, '')
+    if (signingKeyId && signingKeyId.length() > 8) {
+        signingKeyId = signingKeyId.substring(signingKeyId.length() - 8)
+    }
+
+    if (signingKey) {
+        if (signingKey.toString().length() < 256 || !signingKey.toString().contains("BEGIN PGP PRIVATE KEY")) {
+            throw new GradleException(
+                "signingKey does not look like an ASCII-armored PGP private key " +
+                "(got ${signingKey.toString().length()} chars, expected thousands). " +
+                "Paste the full output of `gpg --export-secret-keys --armor <keyId>`.")
+        }
+        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+    }
+
+    sign publishing.publications
+}

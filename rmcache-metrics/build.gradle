@@ -5,12 +5,15 @@ plugins {
 
 group = "com.codeabbot"
 version = "0.0.2"
+description = "RMCache metrics: low-overhead latency-sampling decorator and snapshot for OffHeapCache"
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
 }
+
+apply from: "$rootDir/gradle/maven-publish-conventions.gradle"
 
 repositories {
     mavenCentral()
