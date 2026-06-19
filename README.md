@@ -5,9 +5,9 @@
 
 High-Performance, Billion-Scale Off-Heap Cache for Java 25+ (LTS)
 
-RMCache is a specialized caching library designed for ultra-low latency and massive scalability. By leveraging the Java Foreign Function & Memory (FFM) API, it stores data off-heap and avoids GC pauses even when managing very large data sets.
+RMCache is a specialized caching library for ultra-low latency and billion-scale capacity. It keeps **both keys and values off-heap** through the Java Foreign Function & Memory (FFM) API — with **no `sun.misc.Unsafe`** — so it sidesteps GC pauses at massive scale and stays future-proof as `Unsafe`'s memory-access methods are deprecated for removal from the JVM. That's the structural edge: on-heap caches are GC-bound at scale, and most other off-heap caches either keep keys on-heap (heap-bound at scale) or are built on that deprecated `Unsafe`.
 
-In head-to-head JMH benchmarks, RMCache is the **fastest off-heap cache measured** — ahead of Chronicle Map, OHC, MapDB, and EhCache at every scale — and its **write latency keeps pace with on-heap Caffeine** while keeping the Java heap nearly empty. [See the numbers ↓](#performance-benchmarks)
+In head-to-head JMH benchmarks, RMCache is the **fastest off-heap cache measured** — ahead of Chronicle Map, OHC, MapDB, and EhCache at every scale — its **write latency keeps pace with on-heap Caffeine**, and its **eviction hit rate matches Caffeine's W-TinyLFU** — all while keeping the Java heap nearly empty. [See the numbers ↓](#performance-benchmarks)
 
 > **Requires JDK 25 or later** (LTS release). The FFM API is stable and fully supported from JDK 25. Run with `--enable-native-access=ALL-UNNAMED`.
 
@@ -128,6 +128,21 @@ earns its keep — no GC means no GC-induced jitter. Measured with JMH `SampleTi
 - **RMCache has the lowest GET tail of every cache here — including on-heap Caffeine.** At p99 it is 667 ns vs Caffeine's 834 ns; at p99.9 it is 3,248 ns vs Caffeine's **7,912 ns (2.4× wider)**. Caffeine wins the *median* (291 ns) because it's on-heap — but its tail pays for GC jitter, exactly what RMCache avoids by living off-heap.
 - **RMCache leads PUT through p99** (917 ns, the lowest of all). At the extreme p99.9, Chronicle Map's mmap write path is tighter (4,960 ns); RMCache still beats Caffeine (7,520 vs 9,584 ns).
 - **This is the off-heap payoff:** predictable tails that don't move with GC. For p99-sensitive systems, the flat tail — not the average — is the headline.
+
+### Eviction quality (hit rate)
+
+Speed is worthless if eviction discards the wrong entries. RMCache's SLRU + TinyLFU admission holds
+its own against Caffeine's W-TinyLFU: at **matched capacity** on a Zipfian workload, hit rates land
+**within ±1 pp of Caffeine** and well above plain LRU; on a looping scan (the classic LRU killer)
+RMCache and Caffeine both stay scan-resistant (~88%) while LRU collapses to 0%. So the speed above
+does **not** come at a hit-rate cost.
+
+Reproduce:
+
+```
+java -cp build/libs/rmcache-0.0.2-jmh.jar --enable-native-access=ALL-UNNAMED \
+  com.codeabbot.rmcache.benchmark.HitRateSimulation
+```
 
 ---
 
@@ -324,8 +339,8 @@ implementation 'com.codeabbot:rmcache-micrometer:0.0.2'
 import com.codeabbot.rmcache.micrometer.RMCacheMicrometerMetrics;
 
 RMCacheMicrometerMetrics.monitor(meterRegistry, cache, "users");
-// → cache.gets{result=hit|miss}, cache.puts, cache.removes,
-//   cache.evictions{cause}, cache.size, cache.memory.used / cache.memory.max
+// → cache.gets{result=hit|miss}, cache.puts, cache.removes, cache.evictions,
+//   cache.evictions.cause{cause}, cache.size, cache.memory.used / cache.memory.max
 ```
 Pull-based: meters read `cache.getStats()` only on the registry's scrape interval — **never on the get/put hot path**.
 

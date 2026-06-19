@@ -42,7 +42,8 @@ RMCache-specific ones:
 | `cache.gets` | `result=hit\|miss` | get hits / misses |
 | `cache.puts` | — | put count |
 | `cache.removes` | — | remove count |
-| `cache.evictions` | `cause=size\|ttl\|explicit` | evictions by cause |
+| `cache.evictions` | — | total evictions |
+| `cache.evictions.cause` | `cause=size\|ttl\|explicit` | evictions broken down by cause |
 | `cache.size` | — | live entry count |
 | `cache.memory.used` / `cache.memory.max` | — | off-heap bytes used / budget |
 

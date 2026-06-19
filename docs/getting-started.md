@@ -40,6 +40,19 @@ For module-path applications:
 --enable-native-access=com.codeabbot.rmcache
 ```
 
+### Optional Modules
+
+Add only what you need — all share the core version:
+
+| Module | Artifact | For |
+| :--- | :--- | :--- |
+| Micrometer metrics | `com.codeabbot:rmcache-micrometer` | Prometheus / Datadog / etc. via Micrometer |
+| OpenTelemetry metrics | `com.codeabbot:rmcache-opentelemetry` | OTel observable metrics |
+| Latency sampling | `com.codeabbot:rmcache-metrics` | Per-operation latency (`MeteredOffHeapCache`) |
+| JCache (JSR-107) | `com.codeabbot:rmcache-jcache` | Spring Cache / Hibernate L2 |
+
+See [Metrics](metrics.md) and [JCache Provider](jcache.md).
+
 ---
 
 ## Your First Cache

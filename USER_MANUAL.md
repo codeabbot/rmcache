@@ -185,3 +185,45 @@ Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 }));
 ```
 Failure to call `close()` will result in native memory leaks.
+
+## 7. Observability (Metrics)
+
+Operation counts are always available — and free — via `cache.getStats()`:
+
+```java
+OffHeapCache.CacheStats s = cache.getStats();
+s.hitRate(); s.puts(); s.evictionsByTtl(); s.memoryUsagePercent();
+```
+
+For a monitoring backend, add the matching module. Both are **pull-based** — meters read `getStats()` only on the scrape/export interval, never on the `get`/`put` hot path:
+
+```gradle
+implementation 'com.codeabbot:rmcache-micrometer:0.0.2'     // Micrometer
+implementation 'com.codeabbot:rmcache-opentelemetry:0.0.2'  // OpenTelemetry
+```
+```java
+RMCacheMicrometerMetrics.monitor(meterRegistry, cache, "users");
+AutoCloseable handle = RMCacheOpenTelemetryMetrics.register(meter, cache, "users");
+```
+
+For per-operation **latency** (which counts cannot give), wrap the cache in `rmcache-metrics`'
+`MeteredOffHeapCache` (1-in-N sampling, off the hot path). See [docs/metrics.md](docs/metrics.md).
+
+## 8. JCache (JSR-107)
+
+Use RMCache through the standard `javax.cache` API — a drop-in provider for Spring Cache and Hibernate second-level cache:
+
+```gradle
+implementation 'com.codeabbot:rmcache-jcache:0.0.2'
+```
+```java
+CacheManager manager = Caching.getCachingProvider().getCacheManager();
+Cache<String, byte[]> cache = manager.createCache("users",
+        new RMCacheConfiguration<String, byte[]>()
+                .setTypes(String.class, byte[].class)
+                .setOffHeapMemoryBytes(4L << 30)   // off-heap sizing (JSR-107 has no vocabulary for it)
+                .setMaxEntries(20_000_000));
+```
+
+Store-by-value, atomic `invoke`, `ExpiryPolicy` → TTL, and JMX statistics. See
+[docs/jcache.md](docs/jcache.md) for the full operation surface and Phase-1 limitations.
