@@ -36,8 +36,10 @@ tasks.withType(Test).configureEach {
 jmh {
     iterations = 2
     warmupIterations = 1
+    timeOnIteration = "3s"
+    warmup = "2s"
     fork = 1
     threads = 4
-    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Xmx4g"]
+    jvmArgs = ["--enable-native-access=ALL-UNNAMED", "-Xmx4g", "-XX:+UseG1GC"]
     resultFormat = "text"
 }
