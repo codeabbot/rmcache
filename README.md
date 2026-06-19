@@ -23,6 +23,8 @@ In head-to-head JMH benchmarks, RMCache is the **fastest off-heap cache measured
 - GhostCache L1: HEAP, OFF_HEAP, DISABLED, or AUTO selection.
 - Memory estimator and index memory budgeting for predictable capacity planning.
 - Background eviction to keep hot path latency low.
+- Pull-based metrics with **zero hot-path cost**: Micrometer and OpenTelemetry bindings.
+- **JSR-107 (JCache)** provider: drop-in for Spring Cache and Hibernate second-level cache.
 
 ---
 
@@ -301,6 +303,69 @@ try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
 
 ---
 
+## Modules & Integrations
+
+RMCache is published as a set of modules — add only what you need. All share the core version (`0.0.2`) and are available from Maven Central under `com.codeabbot`.
+
+| Module | Artifact | Purpose |
+| :--- | :--- | :--- |
+| Core | `com.codeabbot:rmcache` | The off-heap cache + `CacheBuilder` |
+| Metrics | `com.codeabbot:rmcache-metrics` | Opt-in latency-sampling decorator (`MeteredOffHeapCache`) + stats snapshot |
+| Micrometer | `com.codeabbot:rmcache-micrometer` | Binds cache stats to a Micrometer `MeterRegistry` |
+| OpenTelemetry | `com.codeabbot:rmcache-opentelemetry` | Exposes cache stats as OpenTelemetry observable metrics |
+| JCache (JSR-107) | `com.codeabbot:rmcache-jcache` | Standard `javax.cache` provider (Spring Cache / Hibernate L2) |
+
+### Metrics — Micrometer
+
+```gradle
+implementation 'com.codeabbot:rmcache-micrometer:0.0.2'
+```
+```java
+import com.codeabbot.rmcache.micrometer.RMCacheMicrometerMetrics;
+
+RMCacheMicrometerMetrics.monitor(meterRegistry, cache, "users");
+// → cache.gets{result=hit|miss}, cache.puts, cache.removes,
+//   cache.evictions{cause}, cache.size, cache.memory.used / cache.memory.max
+```
+Pull-based: meters read `cache.getStats()` only on the registry's scrape interval — **never on the get/put hot path**.
+
+### Metrics — OpenTelemetry
+
+```gradle
+implementation 'com.codeabbot:rmcache-opentelemetry:0.0.2'
+```
+```java
+import com.codeabbot.rmcache.opentelemetry.RMCacheOpenTelemetryMetrics;
+
+AutoCloseable handle = RMCacheOpenTelemetryMetrics.register(meter, cache, "users");
+// handle.close() on shutdown to stop observing
+```
+Observable instruments — read only on the OTel export interval, never on `get`/`put`.
+
+### JCache (JSR-107)
+
+```gradle
+implementation 'com.codeabbot:rmcache-jcache:0.0.2'
+```
+```java
+import javax.cache.*;
+import com.codeabbot.rmcache.jcache.RMCacheConfiguration;
+
+CachingProvider provider = Caching.getCachingProvider();   // auto-discovers RMCache
+CacheManager manager = provider.getCacheManager();
+Cache<String, byte[]> cache = manager.createCache("users",
+        new RMCacheConfiguration<String, byte[]>()
+                .setTypes(String.class, byte[].class)
+                .setOffHeapMemoryBytes(4L << 30)   // RMCache-specific sizing
+                .setMaxEntries(20_000_000));
+
+cache.put("user:1", data);
+byte[] v = cache.get("user:1");
+```
+Drop-in JSR-107 provider for Spring Cache and Hibernate L2: store-by-value, atomic `invoke`, `ExpiryPolicy` → TTL, and JMX statistics. See [JCache Provider](docs/jcache.md) for the full surface and Phase-1 limitations.
+
+---
+
 ## Serializer Helper
 
 For custom value types, use `SerializerHelper` to build a `SegmentValueSerializer` without boilerplate.
@@ -409,6 +474,8 @@ Higher load factor:
 | [Custom Serialization](docs/custom-serialization.md) | Custom types, segment serializer, framework adapters |
 | [Zero-Copy Access](docs/zero-copy-access.md) | `getZeroCopy`/`getView` safety and usage |
 | [Heap Profile](docs/heap-profile.md) | Heap breakdown and zero-heap configurations |
+| [Metrics](docs/metrics.md) | Micrometer + OpenTelemetry integration (zero hot-path cost) |
+| [JCache Provider](docs/jcache.md) | JSR-107 provider for Spring Cache / Hibernate L2 |
 | [Architecture](ARCHITECTURE.md) | Internals: memory layout, concurrency model, data structures |
 | [Architecture Deep Dive](ARCHITECTURE-DEEP-DIVE.md) | Full builder reference, troubleshooting |
 | [Security Policy](SECURITY.md) | Vulnerability reporting |
