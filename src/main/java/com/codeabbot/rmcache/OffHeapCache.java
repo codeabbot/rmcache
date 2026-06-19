@@ -212,6 +212,8 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
     record CacheStats(
             long hits,
             long misses,
+            long puts,
+            long removes,
             long evictions,
             int size,
             long memoryUsedBytes,

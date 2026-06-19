@@ -1,0 +1,34 @@
+plugins {
+    id 'java-library'
+}
+
+group = "com.codeabbot"
+version = "0.0.2"
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    api project(':')
+    api platform(libs.opentelemetry.bom)
+    api libs.opentelemetry.api
+
+    testImplementation platform(libs.junit.bom)
+    testImplementation libs.bundles.testing
+    testImplementation platform(libs.opentelemetry.bom)
+    testImplementation libs.opentelemetry.sdk
+    testImplementation libs.opentelemetry.sdk.testing
+    testRuntimeOnly libs.junit.platform.launcher
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+}

@@ -100,6 +100,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     private final LongAdder globalHits = new LongAdder();
     private final LongAdder globalMisses = new LongAdder();
+    private final LongAdder globalPuts = new LongAdder();
+    private final LongAdder globalRemoves = new LongAdder();
     private final LongAdder globalEvictions = new LongAdder();
     private final LongAdder evictionsBySize = new LongAdder();
     private final LongAdder evictionsByTtl = new LongAdder();
@@ -346,6 +348,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             throw new IllegalStateException("Closed");
 
         putInternal(key, value, ttl, priority);
+        globalPuts.increment();
     }
 
     private void putInternal(K key, V value, Duration ttl, short priority) {
@@ -753,6 +756,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         removeInternal(keyHash, keyBytes, keyLen, slot, EvictionCause.EXPLICIT);
+        globalRemoves.increment();
         return true;
     }
 
@@ -764,7 +768,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public boolean putIfAbsent(K key, V value, Duration ttl) {
         checkNotClosed();
-        return putInternal(key, value, ttl, (short) 0, true);
+        boolean inserted = putInternal(key, value, ttl, (short) 0, true);
+        if (inserted) {
+            globalPuts.increment();
+        }
+        return inserted;
     }
 
     @Override
@@ -877,6 +885,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         return new CacheStats(
                 globalHits.sum(),
                 globalMisses.sum(),
+                globalPuts.sum(),
+                globalRemoves.sum(),
                 globalEvictions.sum(),
                 size(),
                 allocator.getUsedBytes(),
