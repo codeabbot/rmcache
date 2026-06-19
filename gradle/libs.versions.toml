@@ -3,6 +3,7 @@ slf4j = "2.0.12"
 logback = "1.5.12"
 micrometer-core = "1.14.0"
 opentelemetry = "1.43.0"
+cacheApi = "1.1.1"
 
 # test dependencies — JUnit versions (Jupiter 5.x + Platform 1.x) are aligned
 # via the JUnit BOM (junit-bom) so they can never drift apart.
@@ -26,6 +27,7 @@ opentelemetry-bom = { module = "io.opentelemetry:opentelemetry-bom", version.ref
 opentelemetry-api = { module = "io.opentelemetry:opentelemetry-api" }
 opentelemetry-sdk = { module = "io.opentelemetry:opentelemetry-sdk" }
 opentelemetry-sdk-testing = { module = "io.opentelemetry:opentelemetry-sdk-testing" }
+javax-cache = { module = "javax.cache:cache-api", version.ref = "cacheApi" }
 
 # JUnit — version managed by junit-bom (declared as a platform in build.gradle).
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }

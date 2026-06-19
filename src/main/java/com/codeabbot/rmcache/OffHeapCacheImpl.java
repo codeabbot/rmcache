@@ -509,11 +509,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (evictionPolicy.shouldEvict()) {
+            // (A) maxEntries must bound residency. With background eviction the async drain can
+            // lag far behind a write burst and let the cache float up to the *memory* limit
+            // instead of maxEntries (observed ~6x overshoot at small caps). Keep the async
+            // request to help the common memory-pressure case proceed off the hot path, but also
+            // evict synchronously while we are over the cap so maxEntries is a real bound.
             if (backgroundEviction) {
                 requestEviction(false);
-            } else {
-                evictIfNeeded();
             }
+            evictIfNeeded();
         }
 
         int slot = (segSer != null)
