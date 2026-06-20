@@ -7,7 +7,7 @@ cacheApi = "1.1.1"
 
 # test dependencies — JUnit versions (Jupiter 5.x + Platform 1.x) are aligned
 # via the JUnit BOM (junit-bom) so they can never drift apart.
-junit = "5.11.0"
+junit = "6.1.0"
 assertj = "3.26.3"
 mockito = "5.14.2"
 
