@@ -642,7 +642,17 @@ public class EntryPool implements AutoCloseable {
                     byte fingerprint = computeFingerprint(keyBytes, keyLen);
                     writeHeader(absOffset, keyHash, capacity, sizeClass, priority,
                             expiresAtMillis, slot, fingerprint);
-                    boolean ok = writeDataWithSerializer(absOffset, keyBytes, keyLen, valueMaxLen, serializer, value);
+                    boolean ok;
+                    try {
+                        ok = writeDataWithSerializer(absOffset, keyBytes, keyLen, valueMaxLen, serializer, value);
+                    } catch (RuntimeException | Error e) {
+                        // #9: a serializer that throws (e.g. a strict-mode bounds violation) must
+                        // not leak the freshly allocated block — free it and the slot, then rethrow.
+                        long relOffset = absOffset - baseAddr;
+                        allocator.freePacked(AllocationHandle.pack(relOffset, capacity, sizeClass));
+                        freeTop.incrementAndGet();
+                        throw e;
+                    }
                     if (!ok) {
                         long relOffset = absOffset - baseAddr;
                         allocator.freePacked(AllocationHandle.pack(relOffset, capacity, sizeClass));
@@ -874,7 +884,16 @@ public class EntryPool implements AutoCloseable {
                     int newSc = AllocationHandle.unpackSizeClass(packedHandle);
                     byte fingerprint = computeFingerprint(k, k.length);
                     writeHeader(newAbsOffset, h, newCapacity, newSc, p, e, slot, fingerprint);
-                    boolean ok = writeDataWithSerializer(newAbsOffset, k, k.length, valueMaxLen, serializer, value);
+                    boolean ok;
+                    try {
+                        ok = writeDataWithSerializer(newAbsOffset, k, k.length, valueMaxLen, serializer, value);
+                    } catch (RuntimeException | Error ex) {
+                        // #9: free the freshly allocated (larger) block if the serializer throws;
+                        // the original block is left intact. Rethrow so the caller sees it.
+                        long newRelOffset = newAbsOffset - baseAddr;
+                        allocator.freePacked(AllocationHandle.pack(newRelOffset, newCapacity, newSc));
+                        throw ex;
+                    }
                     if (!ok) {
                         long newRelOffset = newAbsOffset - baseAddr;
                         allocator.freePacked(AllocationHandle.pack(newRelOffset, newCapacity, newSc));

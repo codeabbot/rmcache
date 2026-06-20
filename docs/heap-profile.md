@@ -6,14 +6,14 @@ RMCache's primary design goal is to keep JVM heap usage negligible regardless of
 
 ## The Near-Zero Heap Guarantee
 
-All **data** — key bytes, value bytes, hash table slot arrays, LRU linked list nodes, frequency sketch counters — lives in native memory allocated via `malloc`. The Java heap holds only control-plane objects whose size is independent of entry count.
+All **data** — key bytes, value bytes, hash table slot arrays, GhostCache L1, LRU linked list nodes, frequency sketch counters — lives in native memory allocated via `malloc` by default. The Java heap holds only control-plane objects whose size is independent of entry count. `GhostCacheMode.HEAP` is an explicit opt-in.
 
 **Steady-state heap formula:**
 
 ```
 Heap ≈ FixedOverhead (1.5 MB)
      + PerThread (260 KB × activeThreads)
-     + GhostCache (0 in OFF_HEAP / DISABLED mode)
+     + GhostCache (0 by default; ~40 B × ghostCacheSize only with HEAP mode)
 ```
 
 ---
@@ -103,27 +103,28 @@ try (CacheValueView v = cache.getView("key")) { int x = v.getInt(0); }
 
 ### Default Profile
 
-Ghost cache in `HEAP` mode, background eviction on:
+Ghost cache in `OFF_HEAP` mode, background eviction on:
 
 ```java
 new CacheBuilder<String, byte[]>()
     .maxEntries(1_000_000)
     .offHeapMemory(Units.gigabytes(4))
+    .forByteArrayValues()
     .build();
 ```
 
-**Heap:** ~1.5 MB fixed + ~260 KB × threads + ~40 B × ghostCacheSize
+**Heap:** ~1.5 MB fixed + ~260 KB × threads (no ghost cache heap)
 
-### Zero-Heap Profile
+### Explicit Zero-Heap Profile
 
-Best for maximum heap efficiency:
+`zeroHeapProfile()` keeps the default off-heap GhostCache and also enables the low-heap background-eviction profile:
 
 ```java
 new CacheBuilder<String, byte[]>()
-    .zeroHeapProfile()           // OFF_HEAP ghost cache + background eviction
     .maxEntries(1_000_000)
     .offHeapMemory(Units.gigabytes(4))
     .keySerializer(BuiltInSerializers.STRING_KEY_LATIN1)  // zero-alloc key encoding
+    .forByteArrayValues()
     .build();
 ```
 
@@ -135,6 +136,7 @@ new CacheBuilder<String, byte[]>()
 new CacheBuilder<String, byte[]>()
     .backgroundEviction(false)   // eviction on put() caller thread
     .ghostCacheMode(GhostCacheMode.DISABLED)
+    .forByteArrayValues()
     .build();
 ```
 

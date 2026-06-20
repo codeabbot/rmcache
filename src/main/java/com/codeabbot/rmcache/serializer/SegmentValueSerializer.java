@@ -18,16 +18,29 @@ package com.codeabbot.rmcache.serializer;
 import java.lang.foreign.MemorySegment;
 
 /**
- * Serializer that can write values directly into off-heap memory.
+ * Serializer that writes values <b>directly</b> into off-heap memory — a zero-copy fast path
+ * that avoids an intermediate {@code byte[]}.
+ *
+ * <p><b>Trusted extension point.</b> For performance, {@link #serializeTo} receives an
+ * <em>unbounded</em> native destination and runs without per-write bounds checks (much like a
+ * custom allocator hook). An implementation <b>must not write more than {@code maxLen}
+ * bytes</b>; writing beyond it corrupts adjacent off-heap memory and can crash the JVM. The
+ * built-in serializers honor this by construction. When developing or running untrusted
+ * serializers, set {@code CacheBuilder.strictSegmentSerializerBounds(true)} to run custom
+ * serializers against a {@code maxLen}-bounded slice, so an over-write throws
+ * {@link IndexOutOfBoundsException} instead of corrupting memory (at a small per-write cost).
  */
 public interface SegmentValueSerializer<V> extends StreamingSerializer<V> {
     /**
-     * Write value into off-heap memory.
+     * Write value into off-heap memory, starting at {@code offset} and writing at most
+     * {@code maxLen} bytes. Implementations MUST NOT write past {@code offset + maxLen}.
      *
      * @param value  value to serialize
-     * @param dest   destination segment (typically NativeMemory.UNLIMITED)
+     * @param dest   destination segment (the cache passes the unbounded native segment unless
+     *               {@code strictSegmentSerializerBounds} is enabled, in which case a bounded
+     *               slice is passed)
      * @param offset destination offset
-     * @param maxLen maximum allowed bytes
+     * @param maxLen maximum allowed bytes — writing beyond this is a contract violation
      * @return actual bytes written (must be {@literal <=} maxLen)
      */
     int serializeTo(V value, MemorySegment dest, long offset, int maxLen);

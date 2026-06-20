@@ -48,7 +48,7 @@ public final class MemoryEstimator {
         long offsetsBytes = ((long) slotCapacity + 1L) * 8L;
         long freeListBytes = (long) slotCapacity * 4L;
 
-        GhostCacheMode effectiveGhost = (ghostCacheMode == null) ? GhostCacheMode.AUTO : ghostCacheMode;
+        GhostCacheMode effectiveGhost = resolveGhostMode(ghostCacheMode);
         int ghostSize = (ghostCacheSize > 0) ? normalizePowerOfTwo(ghostCacheSize, ghostCacheSize) : 0;
         long ghostBytes = (effectiveGhost == GhostCacheMode.OFF_HEAP) ? ghostSize * 8L : 0L;
 
@@ -84,7 +84,8 @@ public final class MemoryEstimator {
         int slotCapacity = computeSlotCapacity(maxEntries, partitions);
         long offsetsBytes = ((long) slotCapacity + 1L) * 8L;
         long freeListBytes = (long) slotCapacity * 4L;
-        long ghostBytes = (ghostCacheMode == GhostCacheMode.OFF_HEAP && ghostCacheSize > 0)
+        GhostCacheMode effectiveGhost = resolveGhostMode(ghostCacheMode);
+        long ghostBytes = (effectiveGhost == GhostCacheMode.OFF_HEAP && ghostCacheSize > 0)
                 ? (long) normalizePowerOfTwo(ghostCacheSize, ghostCacheSize) * 8L
                 : 0L;
 
@@ -169,6 +170,10 @@ public final class MemoryEstimator {
     private static int autoGhostSize(long entries) {
         int suggested = (int) (entries / 1000);
         return Math.max(64, Math.min(suggested, 32768));
+    }
+
+    private static GhostCacheMode resolveGhostMode(GhostCacheMode mode) {
+        return (mode == null || mode == GhostCacheMode.AUTO) ? GhostCacheMode.OFF_HEAP : mode;
     }
 
     public record MemoryEstimate(

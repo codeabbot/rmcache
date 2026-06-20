@@ -41,10 +41,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * // Do NOT store the view or pass it to another thread.
  * }</pre>
  *
- * <p>The {@link #isValid()} check detects eviction that occurred <i>before</i>
- * the call, but cannot guard against concurrent eviction <i>during</i> a read.
- * For absolute safety, use {@link OffHeapCache#get(Object)} which copies the
- * value to the Java heap.
+ * <p>The {@link #isValid()} check detects this view being closed and simple
+ * prior removals/evictions where the slot is currently free. It cannot prove
+ * that the slot still contains the original value: slot reuse (ABA), cache
+ * close, and concurrent eviction/update during a read remain unsafe. For
+ * absolute safety, use {@link OffHeapCache#get(Object)} which copies the value
+ * to the Java heap.
  *
  * @author Rabindra Meher
  */

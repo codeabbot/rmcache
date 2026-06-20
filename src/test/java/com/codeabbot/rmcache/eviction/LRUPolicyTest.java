@@ -72,6 +72,14 @@ public class LRUPolicyTest {
         policy.close();
     }
 
+    @Test
+    public void closeIsIdempotent() {
+        LRUPolicy policy = new LRUPolicy(200);
+
+        assertDoesNotThrow(policy::close);
+        assertDoesNotThrow(policy::close);
+    }
+
     /**
      * W-TinyLFU admission must consult the frequency sketch at eviction time:
      * when a high-frequency entry sits at the probation LRU tail and a

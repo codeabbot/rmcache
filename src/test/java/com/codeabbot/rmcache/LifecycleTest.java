@@ -98,4 +98,42 @@ public class LifecycleTest {
         // OffHeapCacheImpl.get checks closed and returns null.
         assertNull(cache.get("A"), "Get should return null or fail after close");
     }
+
+    @Test
+    public void testCloseIsIdempotent() {
+        OffHeapCache<String, String> cache = new CacheBuilder<String, String>()
+                .maxEntries(1000)
+                .offHeapMemory(1024 * 1024)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.string())
+                .build();
+
+        cache.put("A", "B");
+        cache.close();
+
+        assertDoesNotThrow(cache::close);
+        assertNull(cache.get("A"), "Get should return null after idempotent close");
+    }
+
+    @Test
+    public void testCloseAfterHeavyLruMaintenanceActivity() {
+        OffHeapCache<String, String> cache = new CacheBuilder<String, String>()
+                .maxEntries(5000)
+                .offHeapMemory(32 * 1024 * 1024)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.string())
+                .build();
+
+        for (int i = 0; i < 5000; i++) {
+            cache.put("key" + i, "value" + i);
+        }
+        for (int round = 0; round < 20; round++) {
+            for (int i = 0; i < 5000; i++) {
+                cache.get("key" + i);
+            }
+        }
+
+        assertDoesNotThrow(cache::close);
+        assertDoesNotThrow(cache::close);
+    }
 }

@@ -18,4 +18,5 @@ lib
 *.bak
 *.iml
 *.log
+hs_err_pid*.log
 local.properties

@@ -45,7 +45,7 @@ RMCache operates as a **library within a trusted JVM process**. It is not a netw
 
 ### `NativeMemory.UNLIMITED`
 
-The `NativeMemory.UNLIMITED` segment (`MemorySegment.ofAddress(0L).reinterpret(Long.MAX_VALUE)`) is an internal implementation detail. It is used **only** within the slab allocator for performance (eliminating per-access bounds checks). It is never exposed through the public API. All public API entry points (`getView`, `getZeroCopy`) have explicit bounds checking.
+The `NativeMemory.UNLIMITED` segment (`MemorySegment.ofAddress(0L).reinterpret(Long.MAX_VALUE)`) is an internal implementation detail used for performance-sensitive native-memory access. It is not exposed directly. Public zero-copy APIs (`getView`, `getZeroCopy`) return or receive bounded value slices and perform explicit bounds checks, but those slices still point to live off-heap memory and must not outlive the documented read scope.
 
 ---
 

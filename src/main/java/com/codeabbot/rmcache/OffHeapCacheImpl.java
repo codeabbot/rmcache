@@ -106,8 +106,13 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final LongAdder evictionsBySize = new LongAdder();
     private final LongAdder evictionsByTtl = new LongAdder();
     private final LongAdder evictionsByExplicit = new LongAdder();
+    // P1: entries declined because allocation failed under memory pressure. Normal
+    // for a bounded cache (not an error), but surfaced so callers can monitor the
+    // decline rate instead of the failure being silent.
+    private final LongAdder globalRejectedPuts = new LongAdder();
 
     private volatile boolean closed = false;
+    private final AtomicBoolean closeOnce = new AtomicBoolean(false);
 
     // AUDIT-A6: static ThreadLocal so cleanupThreadLocals() can release the
     // per-thread value buffer regardless of which cache instance is holding
@@ -174,6 +179,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final long defaultTTLMs;
     private final boolean hasDefaultTTL;
     private final boolean tracksTTL;
+    // #1 optimization: true once any TTL (policy or per-entry) is in play. While false, GET can
+    // skip the per-entry expiry check entirely — a no-TTL cache pays nothing on the read path.
+    private volatile boolean mayHaveTtl;
 
     public OffHeapCacheImpl(
             KeySerializer<K> keySerializer,
@@ -191,7 +199,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             long backgroundEvictionIntervalMs,
             double evictionHighWatermark,
             double evictionLowWatermark,
-            String cacheName) {
+            String cacheName,
+            boolean strictSegmentSerializerBounds) {
         if (logger.isDebugEnabled()) {
             logger.debug("OffHeapCacheImpl init start");
         }
@@ -215,10 +224,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.isByteArrayValue = valueSerializer instanceof ByteArrayValueSerializer;
         this.useKeyMatchFastPath = keySerializer instanceof com.codeabbot.rmcache.serializer.FastKeySerializer;
 
-        // O5: Cache serializer type casts
-        this.cachedSegSer = (valueSerializer instanceof SegmentValueSerializer)
-                ? (SegmentValueSerializer<V>) valueSerializer
-                : null;
+        // O5: Cache serializer type casts.
+        // #9: SegmentValueSerializer is a trusted, performance-oriented extension point — by
+        // default custom impls run on the fast unbounded native path (no per-write bounds
+        // checks), like a custom allocator hook. Opt into strictSegmentSerializerBounds to wrap
+        // *custom* serializers in a maxLen-bounded slice so an over-write throws instead of
+        // corrupting memory. Built-in serializers are correct by construction and never wrapped.
+        if (valueSerializer instanceof SegmentValueSerializer) {
+            SegmentValueSerializer<V> seg = (SegmentValueSerializer<V>) valueSerializer;
+            boolean trusted = (valueSerializer instanceof ByteArrayValueSerializer)
+                    || !strictSegmentSerializerBounds;
+            this.cachedSegSer = trusted ? seg : new BoundedSegmentValueSerializer<>(seg);
+        } else {
+            this.cachedSegSer = null;
+        }
         this.cachedStreamSer = (cachedSegSer == null && valueSerializer instanceof StreamingSerializer)
                 ? (StreamingSerializer<V>) valueSerializer
                 : null;
@@ -236,6 +255,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.defaultTTLMs = defTTL;
         this.hasDefaultTTL = defTTL > 0L;
         this.tracksTTL = evictionPolicy.tracksTTL();
+        this.mayHaveTtl = this.tracksTTL || this.hasDefaultTTL;
 
         maintenanceExecutor.scheduleWithFixedDelay(() -> {
             try {
@@ -347,12 +367,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (closed)
             throw new IllegalStateException("Closed");
 
-        putInternal(key, value, ttl, priority);
-        globalPuts.increment();
-    }
-
-    private void putInternal(K key, V value, Duration ttl, short priority) {
-        putInternal(key, value, ttl, priority, false);
+        // P1 fix: keep the puts counter honest and make declines observable. A
+        // bounded off-heap cache may DECLINE an entry under memory pressure
+        // (allocation can fail transiently even after eviction) — that is normal
+        // lossy-cache behavior, not an error, so we do NOT throw (throwing would turn
+        // routine pressure into application failures). The previous code silently
+        // dropped the entry AND still incremented `puts`, making the failure invisible
+        // and the stat wrong. Count successes and rejections separately so callers can
+        // monitor the decline rate via getStats().rejectedPuts(). putAll() delegates
+        // here, so it is covered too.
+        if (putInternal(key, value, ttl, priority, false)) {
+            globalPuts.increment();
+        } else {
+            globalRejectedPuts.increment();
+        }
     }
 
     private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
@@ -383,6 +411,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 }
                 existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
             }
+        }
+
+        // #3 optimization: for putIfAbsent, return as soon as we know the key exists — before
+        // serializing the value (saves estimateSize/serialize on the CAS-miss path).
+        if (putIfAbsent && existingSlot != 0) {
+            return false;
         }
 
         SegmentValueSerializer<V> segSer = this.cachedSegSer;
@@ -421,6 +455,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         long expiresAtMillis;
         if (ttl != null) {
             expiresAtMillis = CoarseClock.getNow() + ttl.toMillis();
+            mayHaveTtl = true; // #1: a per-entry TTL now exists — GET must check expiry henceforth
         } else if (hasDefaultTTL) {
             expiresAtMillis = CoarseClock.getNow() + defaultTTLMs;
         } else {
@@ -428,10 +463,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (existingSlot != 0) {
-            // Respect putIfAbsent concurrency
-            if (putIfAbsent)
-                return false;
-
+            // putIfAbsent with an existing key already returned above (before serialization).
             // AUDIT-C1 + AUDIT-A3: Pass keyHash for key-hash guard inside updateValue.
             // This catches ghost-cache TOCTOU where slot was reallocated to
             // a different key — one off-heap int read under the SubPool lock.
@@ -454,7 +486,13 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                     }
                 }
                 evictionPolicy.onAccess(existingSlot, keyHash);
-                // Skip ghost cache bookkeeping on updates — slot already tracked
+                // P1 fix: the off-heap ghost maps keyHash->slot (slot is unchanged on
+                // an in-place update, so it stays correct), but the HEAP ghost caches
+                // the value itself — left untouched it would serve the stale
+                // pre-update value on the next get(). Drop the stale L1 entry; the
+                // next get() repopulates it from the core.
+                if (hasGhostCache)
+                    ghostCache.invalidate(keyHash);
                 return true;
             }
         }
@@ -621,6 +659,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         byte[] keyBytes = null;
         int keyLen = 0;
         int slot = 0;
+        boolean slotFromGhost = false; // #2: skip re-writing the off-heap ghost on a ghost hit
         if (hasOffHeapGhostCache) {
             int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
             // Ghost cache's getSlot() already validates the slot via
@@ -632,6 +671,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             // and is guarded by readValueFromSlot's offset check (C3 fix).
             if (ghostSlot != 0) {
                 slot = ghostSlot;
+                slotFromGhost = true;
             }
         }
 
@@ -657,7 +697,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
         }
 
-        if (entryPool.isExpired(slot)) {
+        if (mayHaveTtl && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;
@@ -676,7 +716,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, result);
-        if (hasOffHeapGhostCache)
+        // #2: only (re)write the off-heap ghost when the slot did NOT come from it — on a ghost
+        // hit the mapping is already present, so the native store is redundant.
+        if (hasOffHeapGhostCache && !slotFromGhost)
             offHeapGhostCache.put(keyHash, slot);
 
         return result;
@@ -897,7 +939,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 allocator.getTotalBytes(),
                 evictionsBySize.sum(),
                 evictionsByTtl.sum(),
-                evictionsByExplicit.sum());
+                evictionsByExplicit.sum(),
+                globalRejectedPuts.sum());
     }
 
     @Override
@@ -922,7 +965,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         if (removedSlot != 0) {
             try {
                 if (evictionListener != null) {
-                    K key = keySerializer.deserialize(keyBytes);
+                    K key = keySerializer.deserialize(lookupKey);
                     // Read value EAGERLY before free — prevents use-after-free
                     // if the listener stores the supplier for deferred access
                     byte[] vBytes = entryPool.readValue(removedSlot);
@@ -1096,7 +1139,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
         if (slot == 0)
             return null;
-        if (entryPool.isExpired(slot)) {
+        if (mayHaveTtl && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;
@@ -1177,7 +1220,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
         if (slot == 0)
             return null;
-        if (entryPool.isExpired(slot)) {
+        if (mayHaveTtl && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;
@@ -1204,9 +1247,12 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     @Override
     public void close() {
+        if (!closeOnce.compareAndSet(false, true)) {
+            return;
+        }
         closed = true;
         // Shut down executors FIRST and wait for completion before freeing native
-        // memory
+        // memory.
         if (evictionExecutor != null) {
             evictionExecutor.shutdown();
             try {
@@ -1227,17 +1273,67 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             maintenanceExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
-        entryPool.close();
-        hashTable.close();
-        allocator.close();
-        if (offHeapGhostCache != null) {
-            offHeapGhostCache.close();
-        }
         if (evictionPolicy != null) {
             evictionPolicy.close();
         }
+        if (offHeapGhostCache != null) {
+            offHeapGhostCache.close();
+        }
+        entryPool.close();
+        hashTable.close();
+        allocator.close();
         // H6 fix: Release CoarseClock reference — stops clock thread
         // when the last cache instance is closed.
         CoarseClock.release();
+    }
+
+    /**
+     * #9 fix: wraps a <em>custom</em> (user-provided) {@link SegmentValueSerializer}
+     * so its segment write goes through a {@code maxLen}-bounded slice. A misbehaving
+     * implementation that writes past {@code maxLen} then triggers an
+     * {@link IndexOutOfBoundsException} from the FFM bounds check instead of silently
+     * corrupting the neighbouring off-heap entry. Built-in serializers are correct by
+     * construction and are NOT wrapped, so the common path keeps the unbounded,
+     * bounds-check-free route (no hot-path regression).
+     */
+    private static final class BoundedSegmentValueSerializer<V> implements SegmentValueSerializer<V> {
+        private final SegmentValueSerializer<V> delegate;
+
+        BoundedSegmentValueSerializer(SegmentValueSerializer<V> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public int serializeTo(V value, MemorySegment dest, long offset, int maxLen) {
+            // Bound the writable window to exactly the allocated value capacity so an
+            // over-write throws instead of corrupting the adjacent entry.
+            MemorySegment bounded = dest.asSlice(offset, maxLen);
+            return delegate.serializeTo(value, bounded, 0, maxLen);
+        }
+
+        @Override
+        public int estimateSize(V value) {
+            return delegate.estimateSize(value);
+        }
+
+        @Override
+        public int serializeTo(V value, byte[] dest, int offset) {
+            return delegate.serializeTo(value, dest, offset);
+        }
+
+        @Override
+        public V deserializeFrom(byte[] src, int offset, int length) {
+            return delegate.deserializeFrom(src, offset, length);
+        }
+
+        @Override
+        public byte[] serialize(V value) {
+            return delegate.serialize(value);
+        }
+
+        @Override
+        public V deserialize(byte[] bytes) {
+            return delegate.deserialize(bytes);
+        }
     }
 }

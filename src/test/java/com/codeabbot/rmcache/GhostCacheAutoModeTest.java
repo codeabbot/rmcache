@@ -51,12 +51,36 @@ public class GhostCacheAutoModeTest {
     }
 
     @Test
-    public void autoModeUsesHeapWhenZeroHeapProfileDisabled() throws Exception {
+    public void autoModeUsesOffHeapByDefault() throws Exception {
         OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
                 .maxEntries(1_000)
                 .offHeapMemory(32 * 1024 * 1024)
                 .ghostCacheSize(256)
                 .ghostCacheMode(GhostCacheMode.AUTO)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .build();
+
+        try {
+            OffHeapCacheImpl<?, ?> impl = (OffHeapCacheImpl<?, ?>) cache;
+            Field offHeapField = OffHeapCacheImpl.class.getDeclaredField("offHeapGhostCache");
+            Field heapField = OffHeapCacheImpl.class.getDeclaredField("ghostCache");
+            offHeapField.setAccessible(true);
+            heapField.setAccessible(true);
+            assertNotNull(offHeapField.get(impl));
+            assertNull(heapField.get(impl));
+        } finally {
+            cache.close();
+        }
+    }
+
+    @Test
+    public void explicitHeapModeUsesHeapGhostCache() throws Exception {
+        OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
+                .maxEntries(1_000)
+                .offHeapMemory(32 * 1024 * 1024)
+                .ghostCacheSize(256)
+                .ghostCacheMode(GhostCacheMode.HEAP)
                 .keySerializer(BuiltInSerializers.STRING_KEY)
                 .valueSerializer(BuiltInSerializers.byteArray())
                 .build();

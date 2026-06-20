@@ -188,6 +188,18 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
      */
     String getCacheName();
 
+    /**
+     * Releases all native (off-heap) memory held by this cache.
+     *
+     * <p><b>Concurrency contract:</b> {@code close()} is idempotent (safe to call
+     * more than once), but it is <b>not</b> safe to call while other threads are
+     * still executing {@code get}/{@code put}/{@code clear} or holding a zero-copy
+     * {@link CacheValueView} on this instance. Callers must <b>quiesce</b> their own
+     * access first — stop issuing operations and join their worker threads — before
+     * closing; a caller operation racing with {@code close()} may read freed native
+     * memory and crash the JVM. RMCache stops its own internal maintenance threads
+     * safely during close; this contract is only about <i>caller</i> threads.
+     */
     @Override
     void close();
 
@@ -220,7 +232,8 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
             long memoryTotalBytes,
             long evictionsBySize,
             long evictionsByTtl,
-            long evictionsByExplicit) {
+            long evictionsByExplicit,
+            long rejectedPuts) {
         public double hitRate() {
             long total = hits + misses;
             return (total == 0) ? 0.0 : (double) hits / total;

@@ -18,6 +18,7 @@ package com.codeabbot.rmcache.eviction;
 import com.codeabbot.rmcache.index.EntryPool;
 import com.codeabbot.rmcache.util.CoarseClock;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -44,6 +45,7 @@ public class TTLPolicy implements EvictionPolicy {
     private final long defaultTTLMs; // retained for API/logging purposes
     private final int maxEntries;
     private final OffHeapTimingWheel wheel;
+    private final AtomicBoolean closeOnce = new AtomicBoolean(false);
     private final AtomicInteger entryCount = new AtomicInteger(0);
 
     /**
@@ -200,6 +202,9 @@ public class TTLPolicy implements EvictionPolicy {
 
     @Override
     public void close() {
+        if (!closeOnce.compareAndSet(false, true)) {
+            return;
+        }
         if (wheel != null)
             wheel.close();
     }

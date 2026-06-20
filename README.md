@@ -20,11 +20,11 @@ In head-to-head JMH benchmarks, RMCache is the **fastest off-heap cache measured
 - 64-bit slot packing: one 64-bit read for hash + slot.
 - Key-match fast path + fingerprint check to reduce unnecessary comparisons.
 - Zero-copy reads and large-value streaming support.
-- GhostCache L1: HEAP, OFF_HEAP, DISABLED, or AUTO selection.
+- GhostCache L1: AUTO defaults to OFF_HEAP; HEAP and DISABLED are explicit opt-ins.
 - Memory estimator and index memory budgeting for predictable capacity planning.
 - Background eviction to keep hot path latency low.
 - Pull-based metrics with **zero hot-path cost**: Micrometer and OpenTelemetry bindings.
-- **JSR-107 (JCache)** provider: drop-in for Spring Cache and Hibernate second-level cache.
+- **JSR-107 (JCache)** provider (Phase 1): drop-in for Spring Cache and Hibernate second-level cache — core operations; see the [Phase-1 limitations](docs/jcache.md).
 
 ---
 
@@ -38,8 +38,8 @@ flowchart LR
   C --> E["EntryPool"]
   E --> F["SlabAllocator"]
   F --> G["BuddyAllocator for large blocks"]
-  C --> H["GhostCache (heap)"]
-  C --> I["OffHeapGhostCache"]
+  C --> H["OffHeapGhostCache (default)"]
+  C --> I["GhostCache (HEAP opt-in)"]
   D --> J["Native Memory"]
   E --> J
   F --> J
@@ -170,7 +170,7 @@ numbers on faith.
 
 - **Striped locks (up to 64 shards)** partition the table so writers to different keys rarely contend.
 - **Background eviction.** W-TinyLFU admission (SLRU + Count-Min sketch) runs off the hot path against high/low memory watermarks, so eviction decisions never appear in your GET/PUT latency.
-- **Everything is off-heap** — keys, values, the hash table, free lists, and eviction metadata. The Java heap stays nearly empty (< 50 MB for 1M entries), so GC pauses don't grow with cache size. That is the whole point: hold **billions of entries** without the GC ever walking them.
+- **Everything is off-heap by default** — keys, values, the hash table, free lists, GhostCache L1, and eviction metadata. The Java heap stays nearly empty (< 50 MB for 1M entries), so GC pauses don't grow with cache size. `GhostCacheMode.HEAP` remains available as an explicit opt-in for small caches.
 - **No `sun.misc.Unsafe`.** RMCache uses only the stable Java FFM API (`java.lang.foreign`), so it stays forward-compatible as the JDK locks `Unsafe` down — unlike older `Unsafe`-based off-heap caches.
 
 Full memory layout, concurrency model, and data-structure internals are documented in
@@ -295,6 +295,7 @@ try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .averageValueSize(256)
         .offHeapMemory(Units.gigabytes(4))
         .ghostCacheMode(GhostCacheMode.AUTO)
+        .forByteArrayValues()
         .build()) {
 
     cache.put("user:123", new byte[256]);
@@ -306,10 +307,11 @@ try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
 
 ```java
 try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
-        .zeroHeapProfile() // off-heap ghost cache + background eviction
+        .zeroHeapProfile() // keeps off-heap ghost cache + background eviction
         .ghostCacheMode(GhostCacheMode.AUTO)
         .maxEntries(5_000_000)
         .offHeapMemory(Units.gigabytes(16))
+        .forByteArrayValues()
         .build()) {
 
     // zero-heap hot-path
@@ -328,7 +330,7 @@ RMCache is published as a set of modules — add only what you need. All share t
 | Metrics | `com.codeabbot:rmcache-metrics` | Opt-in latency-sampling decorator (`MeteredOffHeapCache`) + stats snapshot |
 | Micrometer | `com.codeabbot:rmcache-micrometer` | Binds cache stats to a Micrometer `MeterRegistry` |
 | OpenTelemetry | `com.codeabbot:rmcache-opentelemetry` | Exposes cache stats as OpenTelemetry observable metrics |
-| JCache (JSR-107) | `com.codeabbot:rmcache-jcache` | Standard `javax.cache` provider (Spring Cache / Hibernate L2) |
+| JCache (JSR-107) | `com.codeabbot:rmcache-jcache` | Standard `javax.cache` provider — **Phase 1** (Spring Cache / Hibernate L2; see [limitations](docs/jcache.md)) |
 
 ### Metrics — Micrometer
 
@@ -414,7 +416,7 @@ try (OffHeapCache<String, MyType> cache = new CacheBuilder<String, MyType>()
 | `hashTableInitialCapacity` | auto | Per-stripe hash table capacity. |
 | `indexMemoryBudgetBytes` | unset | Budget index memory and auto-adjust load factor. |
 | `indexMemoryBudgetPercent` | unset | Budget index memory as % of off-heap pool. |
-| `ghostCacheMode` | AUTO | AUTO, HEAP, OFF_HEAP, DISABLED. |
+| `ghostCacheMode` | AUTO | AUTO resolves to OFF_HEAP by default; HEAP and DISABLED are explicit opt-ins. |
 | `ghostCacheSize` | auto | L1 cache capacity. |
 | `stringKeyEncoding` | UTF8 | UTF8 or LATIN1 (faster for ASCII). |
 | `backgroundEviction` | true | Enable background eviction. |
@@ -434,6 +436,7 @@ new CacheBuilder<String, byte[]>()
     .maxEntries(1_000_000)
     .offHeapMemory(Units.gigabytes(8))
     .indexMemoryBudgetPercent(0.15) // 15% of off-heap pool
+    .forByteArrayValues()
     .build();
 ```
 

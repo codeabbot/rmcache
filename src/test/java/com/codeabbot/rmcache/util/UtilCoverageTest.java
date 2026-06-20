@@ -119,6 +119,7 @@ public class UtilCoverageTest {
                 GhostCacheMode.AUTO, 0.10);
         assertNotNull(est);
         assertTrue(est.totalBytes() > 0);
+        assertTrue(est.ghostCacheBytes() > 0, "AUTO ghost should resolve to OFF_HEAP");
     }
 
     @Test
@@ -128,6 +129,7 @@ public class UtilCoverageTest {
                 null, 0.10);
         assertNotNull(est);
         assertTrue(est.totalBytes() > 0);
+        assertTrue(est.ghostCacheBytes() > 0, "null ghost mode should use AUTO/OFF_HEAP");
     }
 
     @Test
@@ -265,6 +267,7 @@ public class UtilCoverageTest {
         assertTrue(estimate.totalBytes() > 0);
         assertTrue(estimate.hashTableStripes() > 0);
         assertTrue(estimate.entryPoolPartitions() > 0);
+        assertTrue(estimate.ghostCacheBytes() > 0);
     }
 
     @Test

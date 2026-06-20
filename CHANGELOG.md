@@ -9,22 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-06-17
+
 ### Added
 - **Metrics integrations** — `rmcache-micrometer` (Micrometer `CacheMeterBinder`) and `rmcache-opentelemetry` (OpenTelemetry observable instruments) expose cache statistics with **zero hot-path cost** (pull-based; read `getStats()` only on the collection/export interval). `rmcache-metrics` adds `MeteredOffHeapCache`, an opt-in latency-sampling decorator. See [docs/metrics.md](docs/metrics.md).
 - **JCache (JSR-107) provider** — `rmcache-jcache` is a standard `javax.cache` provider (drop-in for Spring Cache / Hibernate L2): store-by-value, atomic `invoke` via per-key striped locks, `ExpiryPolicy`→TTL, and JMX statistics. See [docs/jcache.md](docs/jcache.md).
 - **Multi-module Maven Central publishing** — all modules (`rmcache-metrics`, `-micrometer`, `-opentelemetry`, `-jcache`) are now signed and published alongside the core in a single Central Portal deployment bundle (`gradle/maven-publish-conventions.gradle`).
-
-### Fixed
-- **`maxEntries` is now a hard residency cap.** With background eviction enabled, the async drain could lag behind a write burst and let the cache grow to the *memory* limit instead of `maxEntries` (~6× overshoot observed at small caps). The new-key insert path now also evicts synchronously while over the cap, so `maxEntries` is a real bound. Eviction quality (hit rate) verified on par with Caffeine's W-TinyLFU.
-
-## [0.0.2] - 2026-06-17
-
-### Added
 - **Peer benchmark suite** — `FairComparisonScaleBenchmark` now compares RMCache (plain + OFF_HEAP GhostCache) against Caffeine (on-heap reference), Chronicle Map, OHC, MapDB, and EhCache in one internally-consistent run; new `OHCComparisonBenchmark` isolates OHC's `Unsafe`-based allocator. Results published in the README.
 - **Tail-latency benchmark** — `TailLatencyBenchmark` (JMH `SampleTime`) reports p50/p90/p99/p99.9 for GET and PUT at 1M entries; the README shows RMCache's GET tail beating even on-heap Caffeine (off-heap means no GC jitter).
 - **Open-source governance** — `NOTICE`, `CLA.md` (Contributor License Agreement enabling the open-core model), GitHub issue/PR templates, `CODEOWNERS`, and Dependabot configuration.
 - **`examples/` subproject** — 5 runnable examples: `BasicCacheExample`, `TTLExample`, `ZeroCopyExample`, `EvictionExample`, `CustomSerializerExample`. Run via `./gradlew :examples:run<Name>`.
-- **JaCoCo coverage reporting** — `jacocoTestReport` task (HTML + XML) with 65% instruction coverage minimum (`jacocoTestCoverageVerification`). Baseline: 66.6% instruction, 67.9% line.
+- **JaCoCo coverage reporting** — `jacocoTestReport` task (HTML + XML) with 80% instruction coverage minimum (`jacocoTestCoverageVerification`). Current baseline: ~88.6% instruction, ~87.0% line.
 - **MapDB and ChronicleMap as benchmark competitors** — replace NMA in `FairComparisonScaleBenchmark`, `ComparativeWorkloadBenchmark`, `ThroughputBenchmark`, and `MemoryScalabilitySuite`.
 - **`asyncExecutor(Executor)`** builder option — custom bounded executor for `putAsync`/`getAsync` (replaces unbounded `ForkJoinPool.commonPool()`)
 - **Per-cause eviction counters** — `evictionsBySize`, `evictionsByTtl`, `evictionsByExplicit` in `CacheStats` record, backed by `LongAdder`
@@ -46,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BackgroundEvictionTest`** — replaced busy-sleep (20×10ms polling) with deadline-based polling (2s window, 5ms sleep)
 
 ### Fixed
+- **Close lifecycle race** — `OffHeapCacheImpl.close()` now closes the eviction policy before freeing native resources, preventing the LRU maintenance thread from touching unmapped off-heap segments during shutdown.
+- **Close idempotency** — repeated `close()` calls now return immediately after the first shutdown, preventing double-free of native segments.
+- **`CacheValueView.isValid()`** — now detects views whose entry slot has already been removed or evicted before the call; Javadoc clarifies the remaining slot-reuse and concurrent-read limits.
+- **Broken `byte[]` examples** — public quickstarts and docs now configure `.forByteArrayValues()` instead of relying on the default string value serializer.
+- **GhostCache AUTO default** — `GhostCacheMode.AUTO` now resolves to `OFF_HEAP`, so default caches keep the L1 shortcut off-heap unless `HEAP` is explicitly requested.
+- **`maxEntries` residency cap.** With background eviction enabled, the async drain could lag behind a write burst and let the cache grow toward the *memory* limit instead of `maxEntries` (~6× overshoot observed at small caps). The new-key insert path now also evicts synchronously while over the cap, so `maxEntries` bounds steady-state residency — a *convergent* cap (transient overshoot under concurrent bursts is expected and documented, as in Caffeine), not a hard per-instant limit. Eviction quality (hit rate) verified on par with Caffeine's W-TinyLFU.
+- **`put()` failure is observable, not silent.** A put that cannot allocate under memory pressure is no longer counted as a successful `put`; it increments the new `CacheStats.rejectedPuts()` counter. A bounded cache may decline an entry — this is not an error and does not throw, preserving lossy-cache semantics while keeping the `puts` stat honest.
+- **HEAP ghost staleness on update** — an in-place value update now invalidates the on-heap (`GhostCacheMode.HEAP`) L1 entry, so a subsequent `get()` can no longer return the stale pre-update value. The default `OFF_HEAP` ghost was already correct.
+- **`LRUPolicy.close()` shutdown race** — close now force-stops (`shutdownNow`) and re-awaits the maintenance thread if it does not terminate within the grace window, before freeing native shards. Exported `eviction` policies (`LRUPolicy`/`TTLPolicy` and their off-heap structures) are also idempotent on direct `close()`.
+- **Custom segment serializer documented as a trusted extension** — `SegmentValueSerializer` writes directly to native memory with no per-write bounds check by default (zero-copy fast path; implementations must honor `maxLen`). New `CacheBuilder.strictSegmentSerializerBounds(true)` opts custom serializers into a `maxLen`-bounded slice (over-write throws instead of corrupting memory) for development/untrusted use; built-in serializers and the common `byte[]` PUT path are unchanged.
+- **Gradle 10 readiness** — replaced the deprecated `required { … }` signing assignment with `required = { … }`, clearing the space-assignment deprecation.
+- **Docs accuracy** — documented the `close()` / `maxEntries` / resize / ABA concurrency contracts ([ARCHITECTURE.md §11](ARCHITECTURE.md)); corrected the TTL docs (per-entry `put(…, Duration)` is the supported path); fixed the packed allocation-handle layout (40-bit offset, not 48-bit); JCache mentions now flagged **Phase 1**.
 - **ISSUE-017: Entry header alignment** — swapped `slotId` and `expiresAt` positions so `expiresAt` is at offset 8 (8-byte aligned). Replaced `UNALIGNED_LONG` with `ValueLayout.JAVA_LONG`. **17–37% latency improvement** across all benchmark scales.
 - **ISSUE-014: `OffHeapFrequencySketch` thread safety** — replaced plain read/write with `VarHandle.getVolatile` + single-attempt `compareAndExchange`. Eliminates lost increments under concurrent access.
 - **ISSUE-018: CAS double-free guard** — replaced volatile-read + free in `SubPool.free()` with a compare-and-swap. Prevents concurrent double-free corrupting the slab allocator.
@@ -58,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fixed Javadoc errors** — `<=`, `<<` HTML escaping and heading hierarchy in `AllocationHandle`, `OffHeapGhostCache`, `SegmentValueSerializer`, `ValueWriter`, `OffHeapTimingWheel`, `CacheBuilder`
 
 ### Performance
+
+Hot-path read/write optimizations (work-removing — no path does more than before):
+- **No-TTL read fast path** — `get`/`getView`/`getZeroCopy` skip the per-entry expiry check entirely until a TTL (eviction policy or per-entry) is first used, so caches that never use TTL pay nothing for expiry on the read path.
+- **Skip redundant ghost write on hit** — an off-heap-ghost GET hit no longer re-writes the `(hash, slot)` mapping it just read.
+- **`putIfAbsent` short-circuit** — `putIfAbsent`/`computeIfAbsent` on an existing key return before serializing the value, avoiding wasted serialization on CAS-miss workloads.
 
 4 threads, JDK 25, macOS, 256 B values (`FairComparisonScaleBenchmark` + `OHCComparisonBenchmark`, JMH `AverageTime`, all caches measured in one run). Lower is better.
 

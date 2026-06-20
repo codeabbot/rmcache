@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Tests for TTLPolicy using a real EntryPool so expiration reads work off-heap.
  */
+@SuppressWarnings("deprecation") // intentionally exercises the test-only @Deprecated TTLPolicy(long) ctor
 public class TTLPolicyTest {
 
     private static final long MEMORY = 32 * 1024 * 1024L; // 32 MB
@@ -107,6 +108,14 @@ public class TTLPolicyTest {
 
         policy.onRemove(slot);
         assertEquals(0, policy.size());
+    }
+
+    @Test
+    public void closeIsIdempotent() {
+        TTLPolicy policy = new TTLPolicy(60_000L, entryPool);
+
+        assertDoesNotThrow(policy::close);
+        assertDoesNotThrow(policy::close);
     }
 
     @Test
@@ -214,5 +223,13 @@ public class TTLPolicyTest {
         } finally {
             wheel.close();
         }
+    }
+
+    @Test
+    public void timingWheelCloseIsIdempotent() {
+        OffHeapTimingWheel wheel = new OffHeapTimingWheel(entryPool, 1024, 1);
+
+        assertDoesNotThrow(wheel::close);
+        assertDoesNotThrow(wheel::close);
     }
 }

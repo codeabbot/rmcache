@@ -18,7 +18,9 @@ package com.codeabbot.rmcache;
 import com.codeabbot.rmcache.eviction.EvictionCause;
 import com.codeabbot.rmcache.eviction.EvictionListener;
 import com.codeabbot.rmcache.eviction.Priority;
+import com.codeabbot.rmcache.index.OffHeapHashTable;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
+import com.codeabbot.rmcache.serializer.KeySerializer;
 import com.codeabbot.rmcache.serializer.StreamingSerializer;
 import com.codeabbot.rmcache.serializer.StringEncoding;
 import com.codeabbot.rmcache.serializer.ValueSerializer;
@@ -29,6 +31,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
@@ -352,6 +356,56 @@ public class CacheCoverageTest {
     }
 
     @Test
+    void evictionListener_deserializesTrimmedLookupKey() throws Exception {
+        AtomicReference<String> evictedKey = new AtomicReference<>();
+        KeySerializer<String> keySerializer = new KeySerializer<>() {
+            @Override
+            public byte[] serialize(String key) {
+                return key.getBytes(StandardCharsets.UTF_8);
+            }
+
+            @Override
+            public String deserialize(byte[] bytes) {
+                return new String(bytes, StandardCharsets.UTF_8);
+            }
+
+            @Override
+            public int hashCode(String key) {
+                return key.hashCode();
+            }
+        };
+
+        try (OffHeapCache<String, String> cache = new CacheBuilder<String, String>()
+                .maxEntries(1000)
+                .offHeapMemory(MB8)
+                .backgroundEviction(false)
+                .ghostCacheMode(GhostCacheMode.DISABLED)
+                .keySerializer(keySerializer)
+                .valueSerializer(BuiltInSerializers.string())
+                .evictionListener((key, valueSup, cause) -> evictedKey.set(key))
+                .build()) {
+            cache.put("abc", "value");
+
+            int keyHash = spreadForTest(keySerializer.hashCode("abc"));
+            byte[] lookupKey = "abc".getBytes(StandardCharsets.UTF_8);
+            OffHeapCacheImpl<String, String> impl = (OffHeapCacheImpl<String, String>) cache;
+            Field tableField = OffHeapCacheImpl.class.getDeclaredField("hashTable");
+            tableField.setAccessible(true);
+            OffHeapHashTable hashTable = (OffHeapHashTable) tableField.get(impl);
+            int slot = hashTable.getWithLen(keyHash, lookupKey, lookupKey.length);
+            assertTrue(slot > 0);
+
+            Method removeInternal = OffHeapCacheImpl.class.getDeclaredMethod(
+                    "removeInternal", int.class, byte[].class, int.class, int.class, EvictionCause.class);
+            removeInternal.setAccessible(true);
+            byte[] oversizedKeyBuffer = "abc-extra-bytes".getBytes(StandardCharsets.UTF_8);
+            removeInternal.invoke(impl, keyHash, oversizedKeyBuffer, lookupKey.length, slot, EvictionCause.EXPLICIT);
+
+            assertEquals("abc", evictedKey.get());
+        }
+    }
+
+    @Test
     void evictionListener_firesOnSizeEviction() {
         AtomicInteger evictionCount = new AtomicInteger(0);
 
@@ -371,6 +425,14 @@ public class CacheCoverageTest {
             // Some entries must have been evicted
             assertTrue(evictionCount.get() > 0);
         }
+    }
+
+    private static int spreadForTest(int hash) {
+        int h = hash;
+        h ^= h >>> 16;
+        h *= 0x85ebca6b;
+        h ^= h >>> 13;
+        return h;
     }
 
     // ── Eviction filter ──────────────────────────────────────────────────────

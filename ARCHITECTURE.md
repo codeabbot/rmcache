@@ -91,12 +91,14 @@ Each slab uses an `AtomicLongArray` bitmap (1 bit per block):
 `allocatePacked()` returns a 64-bit handle — no heap object:
 
 ```
-Bits 63──56  55──48  47──────────────────────────────────0
-     [rsvd ] [ SC  ] [          byte offset             ]
+Bits 63────────────────24 23──────────────4 3──────0
+     [    byte offset    ] [    capacity    ] [  SC  ]
+            (40 bits)           (20 bits)      (4 bits)
 ```
 
-- **SC** (8 bits): size class index (0–10)
-- **offset** (48 bits): byte offset into the native memory segment
+- **offset** (40 bits): byte offset into the native memory segment — up to 1 TB addressable
+- **capacity** (20 bits): block capacity (stored raw, actual capacity = raw `<< 6`, so up to 64 MB)
+- **SC / size class** (4 bits): slab class 0–10, or 15 (`0xF`) for large blocks
 
 ### Entry Block Layout (Off-Heap)
 
@@ -334,7 +336,48 @@ Heap ≈ FixedOverhead (~1.5 MB)
 
 ---
 
-## 11. File Reference
+## 11. Concurrency Contracts & Known Limitations
+
+RMCache is designed so the off-heap memory lifecycle is predictable. A few behaviours are
+explicit *contracts* rather than guarantees — documented here so production users can reason
+about them. The items marked "planned" have stronger machinery tracked for a later release;
+none of these affects the common get/put hot path.
+
+- **`close()` requires caller quiescence.** `close()` is idempotent and stops RMCache's own
+  maintenance threads safely, but it does **not** fence *caller* threads. Stop issuing
+  operations (and join your worker threads / release any `CacheValueView`) before calling
+  `close()`; an operation racing with `close()` may touch freed native memory. A full
+  in-flight-operation gate would add hot-path cost and is intentionally not imposed.
+
+- **`maxEntries` is a convergent cap, not a hard per-instant limit.** Under a burst of
+  concurrent writers the live count may transiently exceed `maxEntries` before eviction
+  converges back — the same behaviour as other concurrent bounded caches (e.g. Caffeine). Size
+  `offHeapMemory` with headroom. A reservation gate would serialize writes and is not used.
+
+- **Hash-table resize reclamation uses a fixed grace period.** When a stripe's table grows, the
+  retired table is freed after a bounded grace window once readers have drained. This is safe
+  under normal scheduling; a pathological reader pause (debugger break, host suspension) longer
+  than the window is a theoretical risk. Epoch/hazard-pointer reclamation is planned to make
+  this airtight.
+
+- **Copying `get()` has a vanishingly small ABA window.** The value-copy path validates the
+  block offset **and** the stored key-hash after the copy, so a freed-and-reused slot is
+  detected. A wrong-value read would require a slot reused at the *same* offset **and** a new
+  key sharing the *same* 32-bit hash within the copy window — astronomically unlikely, not
+  provably impossible. Per-slot generation stamps are planned to close it entirely. (This
+  concerns the heap-copying `get()`, which is always memory-safe — the value is a heap copy;
+  zero-copy `getView` has its own documented TOCTOU constraints.)
+
+- **Custom `SegmentValueSerializer` is a trusted extension point.** By default custom serializers
+  write to the unbounded native segment with no per-write bounds checks (the zero-copy fast path)
+  and must honor `maxLen` — like a custom allocator hook. Enable
+  `CacheBuilder.strictSegmentSerializerBounds(true)` to run them against a `maxLen`-bounded slice
+  (an over-write then throws instead of corrupting memory), useful for development or untrusted
+  serializers. Built-in serializers are correct by construction and always take the fast path.
+
+---
+
+## 12. File Reference
 
 ### Core
 | File | Description |

@@ -67,7 +67,18 @@ public class CacheBuilder<K, V> {
     private long backgroundEvictionIntervalMs = 10;
     private double evictionHighWatermark = 0.95d;
     private double evictionLowWatermark = 0.90d;
+    private boolean strictSegmentSerializerBounds = false;
 
+    /**
+     * Sets the maximum number of entries the cache tracks before evicting.
+     *
+     * <p><b>Cap semantics:</b> {@code maxEntries} bounds <i>steady-state</i>
+     * residency. Like other concurrent bounded caches (e.g. Caffeine), it is a
+     * <i>convergent</i> cap, not a hard per-instant limit: under a burst of
+     * concurrent writers the live count may transiently exceed {@code maxEntries}
+     * before eviction brings it back down. Size {@link #offHeapMemory(long)} with
+     * headroom for that transient overshoot.
+     */
     public CacheBuilder<K, V> maxEntries(int count) {
         if (count <= 0)
             throw new IllegalArgumentException("maxEntries must be > 0");
@@ -136,9 +147,9 @@ public class CacheBuilder<K, V> {
      *
      * <p>This preset makes two changes:
      * <ol>
-     *   <li>Forces {@link GhostCacheMode#OFF_HEAP} — the ghost cache L1 is stored in native
-     *       memory instead of a Java {@code Entry[]} array, eliminating heap pressure from
-     *       that structure.</li>
+     *   <li>Keeps {@link GhostCacheMode#AUTO}, which resolves to {@link GhostCacheMode#OFF_HEAP}
+     *       by default — the ghost cache L1 is stored in native memory instead of a Java
+     *       {@code Entry[]} array, eliminating heap pressure from that structure.</li>
      *   <li>Enables background eviction — eviction runs on a dedicated daemon thread,
      *       keeping the hot path free of synchronous eviction work.</li>
      * </ol>
@@ -197,6 +208,14 @@ public class CacheBuilder<K, V> {
         return this;
     }
 
+    /**
+     * Configure the L1 ghost cache.
+     *
+     * <p>{@link GhostCacheMode#AUTO} resolves to {@link GhostCacheMode#OFF_HEAP}
+     * so RMCache starts with a fully off-heap data/admission path. Use
+     * {@link GhostCacheMode#HEAP} explicitly only when a small heap-resident L1 is
+     * acceptable.
+     */
     public CacheBuilder<K, V> ghostCacheMode(GhostCacheMode mode) {
         if (mode == null)
             throw new IllegalArgumentException("ghostCacheMode must not be null");
@@ -294,6 +313,25 @@ public class CacheBuilder<K, V> {
         return this;
     }
 
+    /**
+     * Enables bounds enforcement for <b>custom</b>
+     * {@link com.codeabbot.rmcache.serializer.SegmentValueSerializer} implementations
+     * (default {@code false}).
+     *
+     * <p>{@code SegmentValueSerializer} is a trusted, performance-oriented extension point: by
+     * default a custom implementation writes directly into native memory with no per-write
+     * bounds check (like a custom allocator hook) and must honor the {@code maxLen} contract.
+     * Enabling this wraps custom serializers so a write past {@code maxLen} throws
+     * {@link IndexOutOfBoundsException} instead of corrupting adjacent off-heap memory — useful
+     * when developing or running untrusted serializers, at a small per-write cost. Built-in
+     * serializers are correct by construction and are never wrapped, so the common
+     * {@code byte[]} / {@code String} path is unaffected either way.
+     */
+    public CacheBuilder<K, V> strictSegmentSerializerBounds(boolean enabled) {
+        this.strictSegmentSerializerBounds = enabled;
+        return this;
+    }
+
     public CacheBuilder<K, V> backgroundEvictionInterval(Duration interval) {
         if (interval == null)
             throw new IllegalArgumentException("backgroundEvictionInterval must not be null");
@@ -335,7 +373,7 @@ public class CacheBuilder<K, V> {
 
         GhostCacheMode effectiveGhostMode = (ghostCacheMode != null) ? ghostCacheMode : GhostCacheMode.AUTO;
         if (effectiveGhostMode == GhostCacheMode.AUTO) {
-            effectiveGhostMode = zeroHeapProfile ? GhostCacheMode.OFF_HEAP : GhostCacheMode.HEAP;
+            effectiveGhostMode = GhostCacheMode.OFF_HEAP;
         }
 
         double loadFactor = (hashTableLoadFactor != null) ? hashTableLoadFactor : MemoryEstimator.DEFAULT_LOAD_FACTOR;
@@ -417,7 +455,7 @@ public class CacheBuilder<K, V> {
                     evictionListener, evictionFilter, ghostCache, offHeapGhostCache,
                     asyncExecutor,
                     backgroundEviction, backgroundEvictionIntervalMs, evictionHighWatermark, evictionLowWatermark,
-                    cacheName);
+                    cacheName, strictSegmentSerializerBounds);
             return cache;
         } catch (Throwable t) {
             // Clean up partially allocated native resources
@@ -457,7 +495,7 @@ public class CacheBuilder<K, V> {
 
         GhostCacheMode effectiveGhostMode = (ghostCacheMode != null) ? ghostCacheMode : GhostCacheMode.AUTO;
         if (effectiveGhostMode == GhostCacheMode.AUTO) {
-            effectiveGhostMode = zeroHeapProfile ? GhostCacheMode.OFF_HEAP : GhostCacheMode.HEAP;
+            effectiveGhostMode = GhostCacheMode.OFF_HEAP;
         }
 
         double loadFactor = (hashTableLoadFactor != null) ? hashTableLoadFactor : MemoryEstimator.DEFAULT_LOAD_FACTOR;

@@ -95,7 +95,7 @@ public class CacheValueViewImpl implements CacheValueView {
 
     @Override
     public boolean isValid() {
-        return !closed.get();
+        return !closed.get() && entryPool.getOffset(slot) != -1L;
     }
 
     @Override

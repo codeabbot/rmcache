@@ -28,6 +28,7 @@ public class RMCacheExample {
             .maxEntries(10_000_000)
             .offHeapMemory(8L * 1024 * 1024 * 1024) // 8 GB
             .withCacheName("my-cache")
+            .forByteArrayValues()
             .build();
 
         // Put an entry
@@ -64,11 +65,11 @@ The `CacheBuilder` provides extensive options to tune memory and concurrency.
 
 The **Ghost Cache L1** shortcut provides an ultra-fast, direct-mapped lookup that bypasses the hash table.
 It holds only `(hash, slot)` pairs.
-- **`ghostCacheMode(GhostCacheMode.OFF_HEAP)`**: Enables the off-heap ghost cache.
+- **`ghostCacheMode(GhostCacheMode.AUTO)`**: Uses the off-heap ghost cache by default. Use `HEAP` only when a heap-resident L1 shortcut is acceptable.
 - **`ghostCacheSize(int)`**: How many slots the L1 cache holds. A good rule of thumb is `2 * maxEntries`.
 
 ```java
-.ghostCacheMode(GhostCacheMode.OFF_HEAP)
+.ghostCacheMode(GhostCacheMode.AUTO)
 .ghostCacheSize(20_000_000) // 2x maxEntries for optimal hit rate
 ```
 
@@ -142,17 +143,20 @@ EvictionPolicy slru = new LRUPolicy(10_000_000, 10_000_000, 0.01f, 0.80f);
 
 ### Time-to-Live (TTL)
 
-You can construct a `TTLPolicy` for time-based expiration. The `OffHeapTimingWheel` processes expirations efficiently off-heap.
+The supported way to expire entries is **per-entry TTL** on `put`. The expiry is stored
+directly in the entry's off-heap header (zero heap cost) and enforced lazily on access plus
+by the background maintenance sweep:
 
 ```java
-EvictionPolicy ttl = new TTLPolicy(10_000_000); // 10M slots
-.eviction(ttl)
-```
+import java.time.Duration;
 
-You can set TTL on a per-entry basis:
-```java
 cache.put("session:1", tokenBytes, Duration.ofMinutes(30));
+cache.put("token:xyz", value, Duration.ofHours(1));
 ```
+
+Entries written without a TTL never expire (size/memory eviction still applies). A global
+default-TTL policy is an advanced/internal mechanism: the proactive `OffHeapTimingWheel` is
+wired by the cache against its own entry pool and is not constructed directly by applications.
 
 ### Composite Policies
 
@@ -211,7 +215,7 @@ For per-operation **latency** (which counts cannot give), wrap the cache in `rmc
 
 ## 8. JCache (JSR-107)
 
-Use RMCache through the standard `javax.cache` API — a drop-in provider for Spring Cache and Hibernate second-level cache:
+Use RMCache through the standard `javax.cache` API — a **Phase-1** drop-in provider for Spring Cache and Hibernate second-level cache (core operations; see [docs/jcache.md](docs/jcache.md) for the supported surface and limitations):
 
 ```gradle
 implementation 'com.codeabbot:rmcache-jcache:0.0.2'

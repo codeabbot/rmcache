@@ -21,6 +21,12 @@ java {
     withJavadocJar()
 }
 
+tasks.withType(Javadoc).configureEach {
+    // Same Javadoc lint policy as the root project: structural checks on (broken @link,
+    // malformed tags), missing-comment noise off.
+    options.addBooleanOption('Xdoclint:all,-missing', true)
+}
+
 publishing {
     publications {
         maven(MavenPublication) {
@@ -73,7 +79,7 @@ publishing {
 }
 
 signing {
-    required { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
+    required = { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
 
     def signingKey = findProperty("signingKey") ?: System.getenv("SIGNING_KEY")
     def signingPassword = findProperty("signingPassword") ?: System.getenv("SIGNING_PASSWORD")

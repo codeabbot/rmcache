@@ -15,6 +15,7 @@ OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .maxEntries(1_000_000)
         .offHeapMemory(Units.gigabytes(4))
         .eviction(new LRUPolicy(maxEntries))
+        .forByteArrayValues()
         .build();
 ```
 
@@ -45,20 +46,13 @@ new LRUPolicy(maxEntries, maxSlots, 0.01f, 0.80f)
 
 `TTLPolicy` expires entries after a fixed time-to-live. Uses an off-heap hierarchical timing wheel — no heap per-entry overhead.
 
-### Global TTL
+### Global / default TTL
 
-```java
-import com.codeabbot.rmcache.eviction.TTLPolicy;
-
-// All entries expire after 10 minutes
-TTLPolicy ttlPolicy = new TTLPolicy(Duration.ofMinutes(10).toMillis(), entryPool);
-
-OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
-        .maxEntries(100_000)
-        .offHeapMemory(Units.megabytes(512))
-        .eviction(ttlPolicy)
-        .build();
-```
+**Use per-entry TTL (below) for application-level expiry** — it is the supported, zero-config
+path. A *global* default-TTL `TTLPolicy` exists, but its proactive `OffHeapTimingWheel` binds
+to the cache's internal `EntryPool`, which application code does not hold at build time. Direct
+construction (`new TTLPolicy(ttlMs, entryPool)`) is therefore an internal/advanced concern, not
+a public recipe; for normal use, set TTL per entry on `put`.
 
 ### Per-Entry TTL
 
@@ -89,8 +83,14 @@ CompositePolicy policy = new CompositePolicy(List.of(lru, ttl));
 
 OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .eviction(policy)
+        .forByteArrayValues()
         .build();
 ```
+
+> **Note:** the TTL leg above requires the cache's internal `EntryPool` (not available to
+> application code at build time), so this composition is an advanced/internal pattern. For
+> almost all use cases the default SLRU (size-based) eviction plus **per-entry TTL** on `put`
+> is sufficient and needs no manual policy construction.
 
 Both policies run independently. An entry is evicted if either policy selects it as a victim.
 
@@ -105,6 +105,7 @@ import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 
 OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .eviction(new NoEvictionPolicy())
+        .forByteArrayValues()
         .build();
 ```
 
@@ -150,6 +151,7 @@ OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
                 case EXPLICIT -> log.debug("Removed {} (explicit)", key);
             }
         })
+        .forByteArrayValues()
         .build();
 ```
 
@@ -175,6 +177,7 @@ pinnedKeys.add("config:global");
 
 OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .evictionFilter(key -> !pinnedKeys.contains(key))  // true = allow eviction
+        .forByteArrayValues()
         .build();
 ```
 

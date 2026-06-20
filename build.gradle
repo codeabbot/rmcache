@@ -17,6 +17,13 @@ java {
     withJavadocJar()
 }
 
+tasks.withType(Javadoc).configureEach {
+    // Keep structural doc-lint (broken @link, malformed HTML/tags — the real doc bugs) but do
+    // not require a doc comment on every element (accessors, type params, internal-only
+    // classes). Yields a clean, professional Javadoc build while still catching real errors.
+    options.addBooleanOption('Xdoclint:all,-missing', true)
+}
+
 repositories {
     mavenCentral()
 }
@@ -181,7 +188,7 @@ signing {
     // builds. Supports both the classic keyring-file properties
     // (signing.keyId / signing.secretKeyRingFile / signing.password) and an
     // in-memory ASCII-armored key (CI-friendly). In-memory mode wins when set.
-    required { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
+    required = { gradle.taskGraph.allTasks.any { it.name.contains("publish") } }
 
     def signingKey = findProperty("signingKey") ?: System.getenv("SIGNING_KEY")
     def signingPassword = findProperty("signingPassword") ?: System.getenv("SIGNING_PASSWORD")

@@ -19,6 +19,7 @@ import com.codeabbot.rmcache.index.EntryPool;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -64,6 +65,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     // Round-robin counter for victim selection across shards
     private final AtomicInteger victimShardCounter = new AtomicInteger(0);
+    private final AtomicBoolean closeOnce = new AtomicBoolean(false);
 
     private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "rmcache-lru-maintenance");
@@ -146,7 +148,7 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
         frequencySketch.increment(keyHash);
 
-        int stripe = (int) (Thread.currentThread().getId() & stripeMask);
+        int stripe = (int) (Thread.currentThread().threadId() & stripeMask);
         int idx = bufferIndices[stripe].getAndIncrement();
         if (idx < bufferSize) {
             buffers[stripe][idx] = slot;
@@ -350,10 +352,20 @@ public class LRUPolicy implements EvictionPolicy, AutoCloseable {
 
     @Override
     public void close() {
+        if (!closeOnce.compareAndSet(false, true)) {
+            return;
+        }
         executor.shutdown();
         try {
-            executor.awaitTermination(1, TimeUnit.SECONDS);
+            // P2 fix: never free native shards while the maintenance thread might
+            // still be inside drainBuffers(). If it has not stopped within the grace
+            // window, force shutdown and wait again before proceeding to free().
+            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+                executor.awaitTermination(1, TimeUnit.SECONDS);
+            }
         } catch (InterruptedException e) {
+            executor.shutdownNow();
             Thread.currentThread().interrupt();
         }
         for (int i = 0; i < shardCount; i++) {

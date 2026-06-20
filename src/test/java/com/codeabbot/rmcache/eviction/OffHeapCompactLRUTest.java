@@ -73,6 +73,12 @@ public class OffHeapCompactLRUTest {
     }
 
     @Test
+    public void closeIsIdempotent() {
+        assertDoesNotThrow(lru::close);
+        assertDoesNotThrow(lru::close);
+    }
+
+    @Test
     public void testRemoveWindowHead() {
         lru.addToWindow(1);
         lru.addToWindow(2);

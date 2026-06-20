@@ -166,6 +166,24 @@ public class CacheValueViewTest {
     }
 
     @Test
+    public void testGetViewIsValidReturnsFalseAfterRemove() {
+        cache = createCache();
+        String key = "removedKey";
+        byte[] value = "data".getBytes();
+
+        cache.put(key, value);
+
+        CacheValueView view = cache.getView(key);
+        assertNotNull(view);
+        assertTrue(view.isValid());
+        assertTrue(cache.remove(key));
+
+        assertFalse(view.isValid());
+        assertThrows(IllegalStateException.class, view::toByteArray);
+        view.close();
+    }
+
+    @Test
     public void testGetViewThrowsAfterClose() throws Exception {
         cache = createCache();
         String key = "throwKey";

@@ -21,6 +21,7 @@ import com.codeabbot.rmcache.util.CoarseClock;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -62,6 +63,7 @@ public final class OffHeapTimingWheel implements AutoCloseable {
     // ── Shared reference ──────────────────────────────────────────────────────
 
     private final EntryPool entryPool;
+    private final AtomicBoolean closeOnce = new AtomicBoolean(false);
 
     // P4-M1 fix: Volatile hint for lock-free hasExpired().
     // Updated on schedule() and pollExpiredOne(). Slightly stale is OK —
@@ -224,6 +226,9 @@ public final class OffHeapTimingWheel implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!closeOnce.compareAndSet(false, true)) {
+            return;
+        }
         for (int i = 0; i < numStripes; i++) {
             if (heaps[i] != null) {
                 NativeMemory.free(heaps[i]);

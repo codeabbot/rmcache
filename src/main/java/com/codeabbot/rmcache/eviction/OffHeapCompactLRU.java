@@ -18,6 +18,7 @@ package com.codeabbot.rmcache.eviction;
 import com.codeabbot.rmcache.memory.NativeMemory;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Off-Heap implementation of CompactLRU (SLRU policy).
@@ -48,6 +49,7 @@ public class OffHeapCompactLRU implements AutoCloseable {
     // Native memory — segment byte array eliminated by packing into next
     private final MemorySegment next; // top 2 bits = segment, lower 30 bits = next pointer
     private final MemorySegment prev;
+    private final AtomicBoolean closeOnce = new AtomicBoolean(false);
 
     int headWindow = NONE;
     int tailWindow = NONE;
@@ -78,6 +80,9 @@ public class OffHeapCompactLRU implements AutoCloseable {
 
     @Override
     public void close() {
+        if (!closeOnce.compareAndSet(false, true)) {
+            return;
+        }
         NativeMemory.free(next);
         NativeMemory.free(prev);
     }

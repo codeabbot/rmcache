@@ -163,6 +163,7 @@ import java.util.concurrent.Executors;
 
 OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
         .asyncExecutor(Executors.newFixedThreadPool(4))
+        .forByteArrayValues()
         .build();
 ```
 
@@ -203,6 +204,7 @@ new CacheBuilder<String, byte[]>()
     .maxEntries(1_000_000)
     .offHeapMemory(Units.gigabytes(8))
     .indexMemoryBudgetPercent(0.15)
+    .forByteArrayValues()
     .build();
 ```
 
