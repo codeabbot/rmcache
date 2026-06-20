@@ -356,6 +356,11 @@ public class EntryPool implements AutoCloseable {
         return partitions[pIdx].updateValue(slot, valueBytes, valueLen, expectedKeyHash);
     }
 
+    public boolean updateValueWithLenSameSizeFast(int slot, byte[] valueBytes, int valueLen, int expectedKeyHash) {
+        int pIdx = slot >>> partitionShift;
+        return partitions[pIdx].updateValueSameSizeFast(slot, valueBytes, valueLen, expectedKeyHash);
+    }
+
     public boolean updateValueWithWriter(int slot, int valueMaxLen, ValueWriter writer) {
         int pIdx = slot >>> partitionShift;
         return partitions[pIdx].updateValueWithWriter(slot, valueMaxLen, writer, 0);
@@ -750,6 +755,74 @@ public class EntryPool implements AutoCloseable {
                 // window, concurrent optimistic readers saw the slot pointing at
                 // already-reclaimed memory (use-after-free). Matches the ordering
                 // already used by updateValueWithWriter / updateValueWithSerializer.
+                long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
+                int newSc = AllocationHandle.unpackSizeClass(packedHandle);
+                byte fingerprint = computeFingerprint(k, k.length);
+                writeHeader(newAbsOffset, h, AllocationHandle.unpackCapacity(packedHandle),
+                        newSc, p, e, slot, fingerprint);
+                writeData(newAbsOffset, k, k.length, valueBytes, valueLen);
+
+                LONG_HANDLE.setVolatile(offsets, (long) slot * 8L,
+                        packOffset(newAbsOffset, newSc));
+
+                long relOffset = absOffset - baseAddr;
+                allocator.freePacked(AllocationHandle.pack(relOffset, cap, sc));
+                return true;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        public boolean updateValueSameSizeFast(int slot, byte[] valueBytes, int valueLen, int expectedKeyHash) {
+            lock.lock();
+            try {
+                long packed = (long) LONG_HANDLE.getVolatile(offsets, (long) slot * 8L);
+                if (packed == -1L)
+                    return false;
+                long absOffset = unpackAddr(packed);
+                if (expectedKeyHash != 0) {
+                    int storedHash = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset);
+                    if (storedHash != expectedKeyHash)
+                        return false;
+                }
+                int keyLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, absOffset + 20);
+                long vOffset = absOffset + EntryBlockLayout.DATA_OFFSET + EntryBlockLayout.pad(keyLen);
+                int currentLen = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_INT, vOffset);
+
+                if (currentLen == valueLen) {
+                    MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
+                            valueLen);
+                    // Preserve the existing write ordering contract from updateValue():
+                    // bytes first, then length, even when the length is unchanged.
+                    NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
+                    return true;
+                }
+
+                int sc = unpackSC(packed);
+                int cap = (sc >= 0) ? SlabAllocator.SIZE_CLASSES[sc] : 0;
+                int newSize = EntryBlockLayout.computeSize(keyLen, valueLen);
+
+                if (newSize <= cap) {
+                    MemorySegment.copy(valueBytes, 0, NativeMemory.UNLIMITED, ValueLayout.JAVA_BYTE, vOffset + 4,
+                            valueLen);
+                    NativeMemory.UNLIMITED.set(ValueLayout.JAVA_INT, vOffset, valueLen);
+                    return true;
+                }
+
+                int h = getKeyHash(slot);
+                byte[] k = readKey(slot);
+                short p = getPriority(slot);
+                long e = getExpiresAt(slot);
+
+                long packedHandle;
+                try {
+                    packedHandle = allocator.allocatePacked(newSize);
+                } catch (Exception err) {
+                    return false;
+                }
+                if (packedHandle == -1L)
+                    return false;
+
                 long newAbsOffset = baseAddr + AllocationHandle.unpackOffset(packedHandle);
                 int newSc = AllocationHandle.unpackSizeClass(packedHandle);
                 byte fingerprint = computeFingerprint(k, k.length);

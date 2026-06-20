@@ -88,6 +88,35 @@ public final class OffHeapGhostCache implements AutoCloseable {
         return slot;
     }
 
+    public int getSlotWithLen(int keyHash, byte[] keyBytes, int keyLen, EntryPool entryPool) {
+        int idx = keyHash & mask;
+        long entry = NativeMemory.UNLIMITED.get(ValueLayout.JAVA_LONG, baseAddr + ((long) idx << 3));
+        if (entry == 0L) {
+            return 0;
+        }
+
+        int storedHash = (int) (entry >>> 32);
+        if (storedHash != keyHash) {
+            return 0;
+        }
+
+        int slot = (int) entry;
+        if (slot == 0) {
+            return 0;
+        }
+
+        long offset = entryPool.getOffset(slot);
+        if (offset == -1L) {
+            return 0;
+        }
+
+        if (!entryPool.keyEqualsWithLen(offset, keyBytes, keyLen)) {
+            return 0;
+        }
+
+        return slot;
+    }
+
     public void put(int keyHash, int slot) {
         if (slot == 0) {
             return;

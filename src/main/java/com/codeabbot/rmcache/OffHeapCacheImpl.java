@@ -26,6 +26,7 @@ import com.codeabbot.rmcache.index.OffHeapGhostCache;
 import com.codeabbot.rmcache.index.OffHeapHashTable;
 
 import com.codeabbot.rmcache.memory.SlabAllocator;
+import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import com.codeabbot.rmcache.serializer.KeySerializer;
 import com.codeabbot.rmcache.serializer.SegmentValueSerializer;
 import com.codeabbot.rmcache.serializer.StreamingSerializer;
@@ -155,6 +156,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
     private final boolean isStringKey;
     private final boolean isLatin1Key;
+    private final boolean isByteArrayKey;
     private final boolean isByteArrayValue;
     private final boolean useKeyMatchFastPath;
 
@@ -226,6 +228,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         this.isStringKey = keySerializer instanceof StringKeySerializer;
         this.isLatin1Key = (keySerializer instanceof StringKeySerializer s) && s.isLatin1FastPath();
+        this.isByteArrayKey = keySerializer == BuiltInSerializers.BYTE_ARRAY_KEY;
         this.isByteArrayValue = valueSerializer instanceof ByteArrayValueSerializer;
         this.useKeyMatchFastPath = keySerializer instanceof com.codeabbot.rmcache.serializer.FastKeySerializer;
 
@@ -400,10 +403,20 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             // updateValue. This is caught by the key-hash guard inside updateValue
             // (see AUDIT-C1 in EntryPool.SubPool.updateValue) — one off-heap int
             // read under the SubPool lock, zero-cost on the common case.
-            existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                existingSlot = offHeapGhostCache.getSlotWithLen(keyHash, keyBytes, keyLen, entryPool);
+            } else {
+                existingSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            }
         }
         if (existingSlot == 0) {
-            if (useKeyMatchFastPath) {
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                existingSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+            } else if (useKeyMatchFastPath) {
                 existingSlot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
                 if (isLatin1Key && key instanceof String s) {
@@ -429,8 +442,14 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int valueMaxLen = 0;
         byte[] valueBytes = null;
         int valueLen = 0;
+        boolean directByteArrayValue = false;
 
-        if (segSer != null) {
+        if (isByteArrayValue && value instanceof byte[] b) {
+            valueLen = b.length;
+            valueBytes = b;
+            segSer = null;
+            directByteArrayValue = true;
+        } else if (segSer != null) {
             valueMaxLen = Math.max(0, segSer.estimateSize(value));
         } else if (streamSer != null) {
             // PERF: the per-thread scratch buffer is only needed by the streaming
@@ -446,9 +465,6 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 valueLen = streamSer.serializeTo(value, buf, 0);
             }
             valueBytes = buf;
-        } else if (isByteArrayValue && value instanceof byte[] b) {
-            valueLen = b.length;
-            valueBytes = b;
         } else {
             valueBytes = valueSerializer.serialize(value);
             valueLen = valueBytes.length;
@@ -475,7 +491,9 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             // Applied to all three update paths (byte[]/writer/serializer).
             boolean updated = (segSer != null)
                     ? entryPool.updateValueWithSerializer(existingSlot, valueMaxLen, segSer, value, keyHash)
-                    : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen, keyHash);
+                    : directByteArrayValue
+                            ? entryPool.updateValueWithLenSameSizeFast(existingSlot, valueBytes, valueLen, keyHash)
+                            : entryPool.updateValueWithLen(existingSlot, valueBytes, valueLen, keyHash);
 
             if (updated) {
                 // AUDIT-H1: Update TTL on in-place value update only when caller
@@ -666,7 +684,14 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int slot = 0;
         boolean slotFromGhost = false; // #2: skip re-writing the off-heap ghost on a ghost hit
         if (hasOffHeapGhostCache) {
-            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            int ghostSlot;
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                ghostSlot = offHeapGhostCache.getSlotWithLen(keyHash, keyBytes, keyLen, entryPool);
+            } else {
+                ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            }
             // Ghost cache's getSlot() already validates the slot via
             // entryPool.matchesAt() — which confirms the slot is live and
             // the key matches. No hash table re-validation needed.
@@ -681,7 +706,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (slot == 0) {
-            if (useKeyMatchFastPath) {
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+            } else if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
                 if (keyBytes == null) {
@@ -784,7 +813,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int keyLen = 0;
         int slot;
 
-        if (useKeyMatchFastPath) {
+        if (isByteArrayKey && key instanceof byte[] b) {
+            keyBytes = b;
+            keyLen = b.length;
+            slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+        } else if (useKeyMatchFastPath) {
             slot = hashTable.getWithKey(keyHash, key, keySerializer);
         } else {
             if (isLatin1Key && key instanceof String s) {
@@ -1106,12 +1139,23 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         byte[] keyBytes = null;
         int keyLen = 0;
         if (offHeapGhostCache != null) {
-            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            int ghostSlot;
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                ghostSlot = offHeapGhostCache.getSlotWithLen(keyHash, keyBytes, keyLen, entryPool);
+            } else {
+                ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            }
             // P2-C2 fix: Re-validate ghost cache hit through hash table (same as get()),
             // to prevent stale ghost entries returning a slot now owned by a different key.
             if (ghostSlot != 0) {
                 int confirmedSlot;
-                if (useKeyMatchFastPath) {
+                if (isByteArrayKey && key instanceof byte[] b) {
+                    keyBytes = b;
+                    keyLen = b.length;
+                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+                } else if (useKeyMatchFastPath) {
                     confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
                 } else {
                     if (isLatin1Key && key instanceof String s) {
@@ -1134,7 +1178,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (slot == 0) {
-            if (useKeyMatchFastPath) {
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+            } else if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
                 if (keyBytes == null) {
@@ -1189,10 +1237,21 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         int keyLen = 0;
         if (offHeapGhostCache != null) {
             // AUDIT-H2: Re-validate ghost cache hit via hash table (same as getZeroCopy).
-            int ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            int ghostSlot;
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                ghostSlot = offHeapGhostCache.getSlotWithLen(keyHash, keyBytes, keyLen, entryPool);
+            } else {
+                ghostSlot = offHeapGhostCache.getSlot(key, keyHash, entryPool, keySerializer);
+            }
             if (ghostSlot != 0) {
                 int confirmedSlot;
-                if (useKeyMatchFastPath) {
+                if (isByteArrayKey && key instanceof byte[] b) {
+                    keyBytes = b;
+                    keyLen = b.length;
+                    confirmedSlot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+                } else if (useKeyMatchFastPath) {
                     confirmedSlot = hashTable.getWithKey(keyHash, key, keySerializer);
                 } else {
                     if (isLatin1Key && key instanceof String s) {
@@ -1215,7 +1274,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         if (slot == 0) {
-            if (useKeyMatchFastPath) {
+            if (isByteArrayKey && key instanceof byte[] b) {
+                keyBytes = b;
+                keyLen = b.length;
+                slot = hashTable.getWithLen(keyHash, keyBytes, keyLen);
+            } else if (useKeyMatchFastPath) {
                 slot = hashTable.getWithKey(keyHash, key, keySerializer);
             } else {
                 if (keyBytes == null) {
