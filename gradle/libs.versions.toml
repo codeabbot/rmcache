@@ -51,4 +51,4 @@ ehcache = { module = "org.ehcache:ehcache", version.ref = "ehcache" }
 testing = ["jupiter-api", "jupiter-engine", "jupiter-params", "assertj-core", "mockito-core", "mockito-junit-jupiter", "logback-classic"]
 
 [plugins]
-jmh = { id = "me.champeau.jmh", version = "0.7.2" }
+jmh = { id = "me.champeau.jmh", version = "0.7.3" }
