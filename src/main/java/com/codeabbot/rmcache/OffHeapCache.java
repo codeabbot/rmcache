@@ -58,7 +58,8 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
      * 
      * @param key   the key
      * @param value the value
-     * @return true if the value was inserted, false if key already existed
+     * @return true if the value was inserted, false if key already existed or
+     *         insertion was rejected under memory pressure
      */
     boolean putIfAbsent(K key, V value);
 
@@ -68,7 +69,8 @@ public interface OffHeapCache<K, V> extends AutoCloseable {
      * @param key   the key
      * @param value the value
      * @param ttl   time-to-live
-     * @return true if the value was inserted, false if key already existed
+     * @return true if the value was inserted, false if key already existed or
+     *         insertion was rejected under memory pressure
      */
     boolean putIfAbsent(K key, V value, Duration ttl);
 

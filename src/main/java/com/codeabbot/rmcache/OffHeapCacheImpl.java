@@ -111,6 +111,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     // decline rate instead of the failure being silent.
     private final LongAdder globalRejectedPuts = new LongAdder();
 
+    private static final int PUT_REJECTED = 0;
+    private static final int PUT_STORED = 1;
+    private static final int PUT_EXISTS = 2;
+
     private volatile boolean closed = false;
     private final AtomicBoolean closeOnce = new AtomicBoolean(false);
 
@@ -179,9 +183,10 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     private final long defaultTTLMs;
     private final boolean hasDefaultTTL;
     private final boolean tracksTTL;
-    // #1 optimization: true once any TTL (policy or per-entry) is in play. While false, GET can
-    // skip the per-entry expiry check entirely — a no-TTL cache pays nothing on the read path.
-    private volatile boolean mayHaveTtl;
+    // Fast path for caches that have never used TTL. This is flipped before a
+    // per-entry TTL can be published, so ordinary no-TTL reads avoid the native
+    // expiresAt load while TTL-aware caches still honor expiry.
+    private volatile boolean expirationChecksEnabled;
 
     public OffHeapCacheImpl(
             KeySerializer<K> keySerializer,
@@ -255,7 +260,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         this.defaultTTLMs = defTTL;
         this.hasDefaultTTL = defTTL > 0L;
         this.tracksTTL = evictionPolicy.tracksTTL();
-        this.mayHaveTtl = this.tracksTTL || this.hasDefaultTTL;
+        this.expirationChecksEnabled = this.tracksTTL || this.hasDefaultTTL;
 
         maintenanceExecutor.scheduleWithFixedDelay(() -> {
             try {
@@ -376,14 +381,14 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         // and the stat wrong. Count successes and rejections separately so callers can
         // monitor the decline rate via getStats().rejectedPuts(). putAll() delegates
         // here, so it is covered too.
-        if (putInternal(key, value, ttl, priority, false)) {
+        if (putInternal(key, value, ttl, priority, false) == PUT_STORED) {
             globalPuts.increment();
         } else {
             globalRejectedPuts.increment();
         }
     }
 
-    private boolean putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
+    private int putInternal(K key, V value, Duration ttl, short priority, boolean putIfAbsent) {
         int keyHash = spread((isStringKey && key instanceof String s) ? s.hashCode() : keySerializer.hashCode(key));
 
         int existingSlot = 0;
@@ -416,7 +421,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         // #3 optimization: for putIfAbsent, return as soon as we know the key exists — before
         // serializing the value (saves estimateSize/serialize on the CAS-miss path).
         if (putIfAbsent && existingSlot != 0) {
-            return false;
+            return PUT_EXISTS;
         }
 
         SegmentValueSerializer<V> segSer = this.cachedSegSer;
@@ -454,8 +459,8 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         // no TTL policy, so the common path is effectively unchanged.
         long expiresAtMillis;
         if (ttl != null) {
+            expirationChecksEnabled = true;
             expiresAtMillis = CoarseClock.getNow() + ttl.toMillis();
-            mayHaveTtl = true; // #1: a per-entry TTL now exists — GET must check expiry henceforth
         } else if (hasDefaultTTL) {
             expiresAtMillis = CoarseClock.getNow() + defaultTTLMs;
         } else {
@@ -493,7 +498,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 // next get() repopulates it from the core.
                 if (hasGhostCache)
                     ghostCache.invalidate(keyHash);
-                return true;
+                return PUT_STORED;
             }
         }
 
@@ -524,13 +529,13 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (newSlot == 0)
-                    return false;
+                    return PUT_REJECTED;
             }
 
             int oldSlotInTable = hashTable.putEntry(keyHash, keyBytes, keyLen, newSlot, false);
             if (oldSlotInTable == -1) {
                 entryPool.free(newSlot);
-                return false; // K7: probe limit exceeded — insertion failed
+                return PUT_REJECTED; // K7: probe limit exceeded — insertion failed
             } else if (oldSlotInTable != 0) {
                 evictionPolicy.onRemove(oldSlotInTable);
                 entryPool.free(oldSlotInTable);
@@ -543,7 +548,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
             if (hasOffHeapGhostCache)
                 offHeapGhostCache.put(keyHash, newSlot);
-            return true;
+            return PUT_STORED;
         }
 
         if (evictionPolicy.shouldEvict()) {
@@ -572,7 +577,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                     : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                             expiresAtMillis);
             if (slot == 0)
-                return false;
+                return PUT_REJECTED;
         }
 
         try {
@@ -580,7 +585,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             if (oldSlot == -1) {
                 entryPool.free(slot);
                 if (putIfAbsent)
-                    return false;
+                    return PUT_REJECTED;
 
                 evictIfNeeded(true);
                 int retrySlot = (segSer != null)
@@ -589,16 +594,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                         : entryPool.allocateWithLen(keyHash, keyBytes, keyLen, valueBytes, valueLen, priority,
                                 expiresAtMillis);
                 if (retrySlot == 0) {
-                    return false;
+                    return PUT_REJECTED;
                 }
                 int retryOld = hashTable.putEntry(keyHash, keyBytes, keyLen, retrySlot, putIfAbsent);
                 if (retryOld == -1) {
                     entryPool.free(retrySlot);
-                    return false;
+                    return PUT_REJECTED;
                 } else if (retryOld != 0) {
                     if (putIfAbsent) {
                         entryPool.free(retrySlot);
-                        return false;
+                        return PUT_EXISTS;
                     } else {
                         evictionPolicy.onRemove(retryOld);
                         entryPool.free(retryOld);
@@ -613,11 +618,11 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
                 }
                 if (hasGhostCache)
                     ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
-                return true;
+                return PUT_STORED;
             } else if (oldSlot != 0) {
                 if (putIfAbsent) {
                     entryPool.free(slot); // Race: someone else added it
-                    return false;
+                    return PUT_EXISTS;
                 } else {
                     evictionPolicy.onRemove(oldSlot);
                     entryPool.free(oldSlot);
@@ -637,7 +642,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
 
         if (hasGhostCache)
             ghostCache.put(key, keyHash, value, ttl != null ? ttl.toMillis() : 0);
-        return true;
+        return PUT_STORED;
     }
 
     @Override
@@ -697,7 +702,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
             }
         }
 
-        if (mayHaveTtl && entryPool.isExpired(slot)) {
+        if (expirationChecksEnabled && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;
@@ -814,11 +819,15 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
     @Override
     public boolean putIfAbsent(K key, V value, Duration ttl) {
         checkNotClosed();
-        boolean inserted = putInternal(key, value, ttl, (short) 0, true);
-        if (inserted) {
+        int result = putInternal(key, value, ttl, (short) 0, true);
+        if (result == PUT_STORED) {
             globalPuts.increment();
+            return true;
         }
-        return inserted;
+        if (result == PUT_REJECTED) {
+            globalRejectedPuts.increment();
+        }
+        return false;
     }
 
     @Override
@@ -849,12 +858,16 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
 
         // Try to insert (avoids overwrite race conditions)
-        boolean inserted = putInternal(key, computed, ttl, (short) 0, true);
-        if (!inserted) {
-            // Race lost, retrieve the newly updated value
-            return get(key);
+        int result = putInternal(key, computed, ttl, (short) 0, true);
+        if (result == PUT_STORED) {
+            globalPuts.increment();
+            return computed;
         }
-        return computed;
+        if (result == PUT_REJECTED) {
+            globalRejectedPuts.increment();
+        }
+        // Race lost or insert rejected; retrieve the current value if one exists.
+        return get(key);
     }
 
     @Override
@@ -1139,7 +1152,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
         if (slot == 0)
             return null;
-        if (mayHaveTtl && entryPool.isExpired(slot)) {
+        if (expirationChecksEnabled && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;
@@ -1220,7 +1233,7 @@ public class OffHeapCacheImpl<K, V> implements OffHeapCache<K, V> {
         }
         if (slot == 0)
             return null;
-        if (mayHaveTtl && entryPool.isExpired(slot)) {
+        if (expirationChecksEnabled && entryPool.isExpired(slot)) {
             if (keyBytes == null) {
                 keyBytes = entryPool.readKey(slot);
                 keyLen = (keyBytes != null) ? keyBytes.length : 0;

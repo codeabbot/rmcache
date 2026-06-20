@@ -59,6 +59,58 @@ public class ProductionHardeningTest {
         }
     }
 
+    @Test
+    void putIfAbsent_underMemoryPressure_countsRejectedPuts() {
+        try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
+                .maxEntries(500)
+                .averageValueSize(256)
+                .offHeapMemory(1L << 20)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .eviction(new NoEvictionPolicy())
+                .build()) {
+
+            byte[] big = new byte[8192];
+            int attempts = 500;
+            assertDoesNotThrow(() -> {
+                for (int i = 0; i < attempts; i++) {
+                    cache.putIfAbsent("pia-" + i, big);
+                }
+            });
+
+            OffHeapCache.CacheStats s = cache.getStats();
+            assertTrue(s.rejectedPuts() > 0, "expected putIfAbsent rejections under memory pressure");
+            assertEquals(attempts, s.puts() + s.rejectedPuts(),
+                    "putIfAbsent attempts must be counted as successes or rejections");
+        }
+    }
+
+    @Test
+    void computeIfAbsent_underMemoryPressure_countsRejectedPuts() {
+        try (OffHeapCache<String, byte[]> cache = new CacheBuilder<String, byte[]>()
+                .maxEntries(500)
+                .averageValueSize(256)
+                .offHeapMemory(1L << 20)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .eviction(new NoEvictionPolicy())
+                .build()) {
+
+            byte[] big = new byte[8192];
+            int attempts = 500;
+            assertDoesNotThrow(() -> {
+                for (int i = 0; i < attempts; i++) {
+                    cache.computeIfAbsent("cia-" + i, ignored -> big);
+                }
+            });
+
+            OffHeapCache.CacheStats s = cache.getStats();
+            assertTrue(s.rejectedPuts() > 0, "expected computeIfAbsent rejections under memory pressure");
+            assertEquals(attempts, s.puts() + s.rejectedPuts(),
+                    "computeIfAbsent attempts must be counted as successes or rejections");
+        }
+    }
+
     // ── #2: HEAP ghost must not serve a stale value after update ─────────────
     @Test
     void heapGhost_returnsFreshValueAfterUpdate() {
