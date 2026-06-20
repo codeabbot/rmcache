@@ -92,6 +92,8 @@ OffHeapCache<Long, byte[]> cache = new CacheBuilder<Long, byte[]>()
 
 `SegmentValueSerializer` writes directly into the pre-allocated native slab block, eliminating the intermediate `byte[]` on `put()`. This is the highest-performance option for large values.
 
+> **Trusted extension point.** For performance, `serializeTo` receives an *unbounded* native destination and runs with no per-write bounds check. Your implementation **must not write more than `maxLen` bytes** (and must return the exact count) — writing past it corrupts adjacent off-heap memory and can crash the JVM. While developing or running untrusted serializers, enable `CacheBuilder.strictSegmentSerializerBounds(true)`: custom serializers then write through a `maxLen`-bounded slice, so an over-write throws `IndexOutOfBoundsException` instead of silently corrupting memory. Built-in serializers are correct by construction and unaffected.
+
 ```java
 import com.codeabbot.rmcache.serializer.SegmentValueSerializer;
 import com.codeabbot.rmcache.serializer.SerializerHelper;

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.2] - 2026-06-17
+## [0.0.2] - 2026-06-20
 
 ### Added
 - **Metrics integrations** — `rmcache-micrometer` (Micrometer `CacheMeterBinder`) and `rmcache-opentelemetry` (OpenTelemetry observable instruments) expose cache statistics with **zero hot-path cost** (pull-based; read `getStats()` only on the collection/export interval). `rmcache-metrics` adds `MeteredOffHeapCache`, an opt-in latency-sampling decorator. See [docs/metrics.md](docs/metrics.md).
@@ -70,6 +70,7 @@ Hot-path read/write optimizations (work-removing — no path does more than befo
 - **No-TTL read fast path** — `get`/`getView`/`getZeroCopy` skip the per-entry expiry check entirely until a TTL (eviction policy or per-entry) is first used, so caches that never use TTL pay nothing for expiry on the read path.
 - **Skip redundant ghost write on hit** — an off-heap-ghost GET hit no longer re-writes the `(hash, slot)` mapping it just read.
 - **`putIfAbsent` short-circuit** — `putIfAbsent`/`computeIfAbsent` on an existing key return before serializing the value, avoiding wasted serialization on CAS-miss workloads.
+- **byte[]-key word-wise lookup + direct value path** — caches using `BYTE_ARRAY_KEY` now compare keys 8 bytes at a time (`getWithLen` / off-heap-ghost `getSlotWithLen`) instead of byte-by-byte on every lookup; built-in `byte[]` values bypass the generic segment serializer; and same-size updates take a dedicated `updateValueWithLenSameSizeFast` path. Measured on byte[] keys + 256 B values at 1M entries: GET throughput **+22–37%**, PUT update latency **−21%** (non-`byte[]` key types are unaffected).
 
 4 threads, JDK 25, macOS, 256 B values (`FairComparisonScaleBenchmark` + `OHCComparisonBenchmark`, JMH `AverageTime`, all caches measured in one run). Lower is better.
 
