@@ -495,6 +495,7 @@ Higher load factor:
 | [Heap Profile](docs/heap-profile.md) | Heap breakdown and zero-heap configurations |
 | [Metrics](docs/metrics.md) | Micrometer + OpenTelemetry integration (zero hot-path cost) |
 | [JCache Provider](docs/jcache.md) | JSR-107 provider for Spring Cache / Hibernate L2 |
+| [Benchmark Results (2026-06-20)](docs/benchmarks-2026-06-20.md) | Full competitor sweep: TPS, average latency, tail latency |
 | [Architecture](ARCHITECTURE.md) | Internals: memory layout, concurrency model, data structures |
 | [Architecture Deep Dive](ARCHITECTURE-DEEP-DIVE.md) | Full builder reference, troubleshooting |
 | [Security Policy](SECURITY.md) | Vulnerability reporting |
