@@ -342,7 +342,8 @@ import com.codeabbot.rmcache.micrometer.RMCacheMicrometerMetrics;
 
 RMCacheMicrometerMetrics.monitor(meterRegistry, cache, "users");
 // → cache.gets{result=hit|miss}, cache.puts, cache.removes, cache.evictions,
-//   cache.evictions.cause{cause}, cache.size, cache.memory.used / cache.memory.max
+//   cache.puts.rejected, cache.evictions.cause{cause}, cache.size,
+//   cache.memory.used / cache.memory.max
 ```
 Pull-based: meters read `cache.getStats()` only on the registry's scrape interval — **never on the get/put hot path**.
 

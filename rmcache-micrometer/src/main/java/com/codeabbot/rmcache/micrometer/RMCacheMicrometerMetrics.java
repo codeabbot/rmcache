@@ -34,7 +34,8 @@ import io.micrometer.core.instrument.binder.cache.CacheMeterBinder;
  * <p>Standard Micrometer cache names are emitted via {@link CacheMeterBinder}
  * ({@code cache.gets} tagged {@code result=hit|miss}, {@code cache.size},
  * {@code cache.evictions}), plus RMCache extras: {@code cache.memory.used},
- * {@code cache.memory.max}, and {@code cache.evictions.cause} tagged by cause.
+ * {@code cache.memory.max}, {@code cache.puts.rejected}, and
+ * {@code cache.evictions.cause} tagged by cause.
  *
  * <p>{@code cache.puts} and {@code cache.removes} come straight from {@code getStats()};
  * all counts are accurate.
@@ -100,6 +101,11 @@ public class RMCacheMicrometerMetrics extends CacheMeterBinder<OffHeapCache<?, ?
         FunctionCounter.builder("cache.removes", cache, c -> c.getStats().removes())
                 .tags(cacheTags)
                 .description("Cache remove operations")
+                .register(registry);
+
+        FunctionCounter.builder("cache.puts.rejected", cache, c -> c.getStats().rejectedPuts())
+                .tags(cacheTags)
+                .description("Cache put attempts rejected under memory pressure")
                 .register(registry);
 
         Gauge.builder("cache.memory.used", cache, c -> c.getStats().memoryUsedBytes())

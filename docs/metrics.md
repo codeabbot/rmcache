@@ -12,14 +12,15 @@ Every cache exposes a `CacheStats` snapshot directly, with no extra dependency:
 ```java
 OffHeapCache.CacheStats s = cache.getStats();
 s.hits(); s.misses(); s.puts(); s.removes(); s.evictions();
+s.rejectedPuts();
 s.size(); s.memoryUsedBytes(); s.memoryTotalBytes();
 s.evictionsBySize(); s.evictionsByTtl(); s.evictionsByExplicit();
 s.hitRate(); s.missRate(); s.memoryUsagePercent();
 ```
 
-The counters that feed this (hits/misses on `get`, puts on `put`/`putIfAbsent`, removes on
-`remove`, evictions by cause) are always-on and effectively free — see the design notes in
-[Architecture](../ARCHITECTURE.md).
+The counters that feed this (hits/misses on `get`, successful puts, rejected puts,
+removes, evictions by cause) are always-on and effectively free — see the design
+notes in [Architecture](../ARCHITECTURE.md).
 
 ## Micrometer — `rmcache-micrometer`
 
@@ -41,6 +42,7 @@ RMCache-specific ones:
 | :--- | :--- | :--- |
 | `cache.gets` | `result=hit\|miss` | get hits / misses |
 | `cache.puts` | — | put count |
+| `cache.puts.rejected` | — | put attempts rejected under memory pressure |
 | `cache.removes` | — | remove count |
 | `cache.evictions` | — | total evictions |
 | `cache.evictions.cause` | `cause=size\|ttl\|explicit` | evictions broken down by cause |
@@ -66,8 +68,8 @@ handle.close();
 
 Every instrument is **observable** (async): its callback reads `getStats()` only when the OTel SDK
 collects (the export interval). Emits `cache.gets` (`result=hit|miss`), `cache.puts`,
-`cache.removes`, `cache.evictions` (`cause=size|ttl|explicit`), `cache.size`, `cache.memory.used`,
-`cache.memory.max`, each tagged with the `cache` name.
+`cache.puts.rejected`, `cache.removes`, `cache.evictions` (`cause=size|ttl|explicit`),
+`cache.size`, `cache.memory.used`, `cache.memory.max`, each tagged with the `cache` name.
 
 ## Per-operation latency — `rmcache-metrics`
 

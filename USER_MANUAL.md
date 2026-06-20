@@ -196,7 +196,7 @@ Operation counts are always available — and free — via `cache.getStats()`:
 
 ```java
 OffHeapCache.CacheStats s = cache.getStats();
-s.hitRate(); s.puts(); s.evictionsByTtl(); s.memoryUsagePercent();
+s.hitRate(); s.puts(); s.rejectedPuts(); s.evictionsByTtl(); s.memoryUsagePercent();
 ```
 
 For a monitoring backend, add the matching module. Both are **pull-based** — meters read `getStats()` only on the scrape/export interval, never on the `get`/`put` hot path:

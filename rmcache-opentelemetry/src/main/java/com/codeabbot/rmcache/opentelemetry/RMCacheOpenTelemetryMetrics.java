@@ -33,9 +33,10 @@ import java.util.List;
  * regress cache latency.
  *
  * <p>Emits {@code cache.gets} (attribute {@code result=hit|miss}), {@code cache.puts},
- * {@code cache.removes}, {@code cache.evictions} (attribute {@code cause=size|ttl|explicit}),
- * {@code cache.size}, {@code cache.memory.used}, and {@code cache.memory.max}, each tagged
- * with the {@code cache} name attribute.
+ * {@code cache.puts.rejected}, {@code cache.removes}, {@code cache.evictions}
+ * (attribute {@code cause=size|ttl|explicit}), {@code cache.size},
+ * {@code cache.memory.used}, and {@code cache.memory.max}, each tagged with the
+ * {@code cache} name attribute.
  *
  * <pre>{@code
  * AutoCloseable handle = RMCacheOpenTelemetryMetrics.register(meter, cache, "users");
@@ -75,6 +76,10 @@ public final class RMCacheOpenTelemetryMetrics {
         instruments.add(meter.counterBuilder("cache.puts")
                 .setDescription("Cache put operations")
                 .buildWithCallback(m -> m.record(cache.getStats().puts(), base)));
+
+        instruments.add(meter.counterBuilder("cache.puts.rejected")
+                .setDescription("Cache put attempts rejected under memory pressure")
+                .buildWithCallback(m -> m.record(cache.getStats().rejectedPuts(), base)));
 
         instruments.add(meter.counterBuilder("cache.removes")
                 .setDescription("Cache remove operations")

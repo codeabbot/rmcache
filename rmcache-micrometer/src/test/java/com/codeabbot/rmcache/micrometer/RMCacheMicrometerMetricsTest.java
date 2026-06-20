@@ -18,6 +18,7 @@ package com.codeabbot.rmcache.micrometer;
 import com.codeabbot.rmcache.CacheBuilder;
 import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
+import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -64,7 +65,30 @@ class RMCacheMicrometerMetricsTest {
     @Test
     void reportsMemoryAndEvictionCauseMeters() {
         assertThat(registry.get("cache.memory.max").gauge().value()).isGreaterThan(0.0);
+        assertThat(registry.get("cache.puts.rejected").functionCounter().count()).isZero();
         // All three eviction-cause series are registered (0 until evictions occur).
         assertThat(registry.find("cache.evictions.cause").functionCounters()).hasSize(3);
+    }
+
+    @Test
+    void reportsRejectedPuts() {
+        try (OffHeapCache<String, byte[]> small = new CacheBuilder<String, byte[]>()
+                .maxEntries(500)
+                .averageValueSize(256)
+                .offHeapMemory(1L << 20)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .eviction(new NoEvictionPolicy())
+                .build()) {
+            SimpleMeterRegistry localRegistry = new SimpleMeterRegistry();
+            RMCacheMicrometerMetrics.monitor(localRegistry, small, "small");
+
+            byte[] big = new byte[8192];
+            for (int i = 0; i < 500; i++) {
+                small.put("k-" + i, big);
+            }
+
+            assertThat(localRegistry.get("cache.puts.rejected").functionCounter().count()).isGreaterThan(0.0);
+        }
     }
 }

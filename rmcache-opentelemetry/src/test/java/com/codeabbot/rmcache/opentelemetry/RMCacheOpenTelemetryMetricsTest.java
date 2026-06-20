@@ -18,6 +18,7 @@ package com.codeabbot.rmcache.opentelemetry;
 import com.codeabbot.rmcache.CacheBuilder;
 import com.codeabbot.rmcache.OffHeapCache;
 import com.codeabbot.rmcache.Units;
+import com.codeabbot.rmcache.eviction.NoEvictionPolicy;
 import com.codeabbot.rmcache.serializer.BuiltInSerializers;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
@@ -82,5 +83,45 @@ class RMCacheOpenTelemetryMetricsTest {
                 .mapToLong(p -> p.getValue())
                 .sum();
         assertThat(totalGets).isEqualTo(2L); // 1 hit + 1 miss
+    }
+
+    @Test
+    void exportsRejectedPuts() throws Exception {
+        try (OffHeapCache<String, byte[]> small = new CacheBuilder<String, byte[]>()
+                .maxEntries(500)
+                .averageValueSize(256)
+                .offHeapMemory(1L << 20)
+                .keySerializer(BuiltInSerializers.STRING_KEY)
+                .valueSerializer(BuiltInSerializers.byteArray())
+                .eviction(new NoEvictionPolicy())
+                .build()) {
+            InMemoryMetricReader localReader = InMemoryMetricReader.create();
+            SdkMeterProvider localProvider = SdkMeterProvider.builder()
+                    .registerMetricReader(localReader)
+                    .build();
+            try {
+                AutoCloseable localHandle = RMCacheOpenTelemetryMetrics.register(
+                        localProvider.get("rmcache-test-rejected"), small, "small");
+                try {
+                    byte[] big = new byte[8192];
+                    for (int i = 0; i < 500; i++) {
+                        small.put("k-" + i, big);
+                    }
+
+                    MetricData rejected = localReader.collectAllMetrics().stream()
+                            .filter(m -> m.getName().equals("cache.puts.rejected"))
+                            .findFirst()
+                            .orElseThrow();
+                    long rejectedPuts = rejected.getLongSumData().getPoints().stream()
+                            .mapToLong(p -> p.getValue())
+                            .sum();
+                    assertThat(rejectedPuts).isGreaterThan(0L);
+                } finally {
+                    localHandle.close();
+                }
+            } finally {
+                localProvider.close();
+            }
+        }
     }
 }
