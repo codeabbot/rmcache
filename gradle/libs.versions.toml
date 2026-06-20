@@ -9,7 +9,7 @@ cacheApi = "1.1.1"
 # via the JUnit BOM (junit-bom) so they can never drift apart.
 junit = "5.11.0"
 assertj = "3.26.3"
-mockito = "5.14.2"
+mockito = "5.23.0"
 
 # benchmark (jmh) dependencies
 jmh = "1.37"
