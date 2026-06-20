@@ -1,5 +1,6 @@
 # RMCache
-
+[![Maven Central](https://img.shields.io/maven-central/v/com.codeabbot/rmcache.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/com.codeabbot/rmcache)
+[![Java](https://img.shields.io/badge/Java-25%2B-blue.svg)](https://openjdk.org/projects/jdk/25/)
 [![CI](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml/badge.svg)](https://github.com/codeabbot/rmcache/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
