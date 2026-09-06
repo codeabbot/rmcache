@@ -141,8 +141,8 @@ publishing {
                 developers {
                     developer {
                         id = "rabindrameher"
-                        name = "Rabindra Meher"
-                        email = "maintainers@codeabbot.com"
+                        name = "Rabindra"
+                        email = "rabindra@codeabbot.com"
                     }
                 }
                 scm {
